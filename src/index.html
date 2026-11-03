@@ -103,6 +103,15 @@ table.sp .tg[aria-expanded=true]{transform:rotate(90deg)}
 .cachep .badge{font-size:11px;border:1px solid var(--bd);border-radius:999px;padding:0 6px;margin-left:4px;color:var(--mut)}
 .cachep .bar i{background:var(--crc)}
 .cachep .cmore{display:block;margin:8px auto 0}
+.cachep{--cpos:#15803d;--cneg:#c8283f}
+@media (prefers-color-scheme:dark){.cachep{--cpos:#4ade80;--cneg:#f87171}}
+.cachep .pos{color:var(--cpos)}.cachep .neg{color:var(--cneg)}
+.cachep .sptot.small .big{font-size:15px}
+.cachep .badge.pos{border-color:var(--cpos)}.cachep .badge.neg{border-color:var(--cneg)}
+.cachep svg .k-pos{fill:var(--cpos)}.cachep svg .k-neg{fill:var(--cneg)}
+.cachep svg .zero{stroke:var(--mut);stroke-width:1;vector-effect:non-scaling-stroke;opacity:.5}
+.cachep .cleg .k-pos{background:var(--cpos)}.cachep .cleg .k-neg{background:var(--cneg)}
+.cachep th[title]{cursor:help}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:6px 14px;border-radius:6px;opacity:0;pointer-events:none;transition:opacity .15s}
 #toast.show{opacity:.92}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
@@ -223,8 +232,8 @@ function spendDays(agg,sel){
   return dateKeysBetween(lo,hi).map(function(k){var d=agg.days[k];return {date:k,cost:d?d.cost:0,subCost:d?d.subCost:0}});
 }
 function cacheZero(){return {misses:0,missTokens:0,missCost:0,missTtl:0,missTtlTokens:0,missModel:0,missModelTokens:0,
-  relays:0,relayBefore:0,relayAfter:0,relayDropped:0,relayRecache:0,relayRecacheCost:0,
-  compacts:0,compactBefore:0,compactAfter:0,compactDropped:0,compactRecache:0,compactRecacheCost:0}}
+  relays:0,relayBefore:0,relayAfter:0,relayDropped:0,relayRecache:0,relayRecacheCost:0,relayPostRequests:0,relaySavings:0,
+  compacts:0,compactBefore:0,compactAfter:0,compactDropped:0,compactRecache:0,compactRecacheCost:0,compactPostRequests:0,compactSavings:0}}
 var CACHE_KEYS=Object.keys(cacheZero());
 // Pure: rows = /api/index `cache` (may be undefined), sel/projOk as aggregateSpend. Search text never applies.
 // Returns totals and per-day sums (days[date] has the totals shape).
@@ -249,6 +258,7 @@ function cacheDays(agg,sel){
     var ttl=d.missTtlTokens,mod=d.missModelTokens,oth=Math.max(0,d.missTokens-ttl-mod);
     return {date:k,dropped:d.relayDropped+d.compactDropped,recache:d.relayRecache+d.compactRecache,
       recacheCost:d.relayRecacheCost+d.compactRecacheCost,events:d.relays+d.compacts,
+      relaySavings:d.relaySavings,relayCost:d.relayRecacheCost,relayNet:d.relaySavings-d.relayRecacheCost,relays:d.relays,
       misses:d.misses,missTokens:d.missTokens,missCost:d.missCost,missTtl:ttl,missModel:mod,missOther:oth};
   });
 }
@@ -267,6 +277,24 @@ function cacheTriggerCounts(events){
   var c={manual:0,input:0,expiry:0,unknown:0};
   (events||[]).forEach(function(e){if(e.kind!=="relay")return;if(e.trigger==="manual"||e.trigger==="input"||e.trigger==="expiry")c[e.trigger]++;else c.unknown++});
   return c;
+}
+// Pure: relay events by trigger -> {count, profit (net>=0 count), net (sum of net USD)}. Events without a numeric `net` count but not as profit and add 0.
+function cacheNetByTrigger(events){
+  var c={manual:{count:0,profit:0,net:0},input:{count:0,profit:0,net:0},expiry:{count:0,profit:0,net:0},unknown:{count:0,profit:0,net:0}};
+  (events||[]).forEach(function(e){
+    if(e.kind!=="relay")return;
+    var b=c[e.trigger==="manual"||e.trigger==="input"||e.trigger==="expiry"?e.trigger:"unknown"];
+    b.count++;
+    if(typeof e.net==="number"){b.net+=e.net;if(e.net>=0)b.profit++}
+  });
+  return c;
+}
+// Pure: verdict for one event. net>=0 -> paid back; net<0 && open -> not yet (in progress / session ended); net<0 -> loss; no net -> none.
+function cacheVerdict(e){
+  if(typeof e.net!=="number")return {cls:"",label:"–"};
+  if(e.net>=0)return {cls:"pos",label:"回収済"};
+  if(e.open)return {cls:"neg",label:"未回収(進行中/終了)"};
+  return {cls:"neg",label:"赤字"};
 }
 function resumeCommand(file){return "pi --session "+(/\s/.test(file)?"\""+file+"\"":file)}
 
@@ -418,6 +446,7 @@ function renderSpend(){
 }
 var CACHE_LIMIT=50;
 var TRIG={manual:"手動",input:"入力時",expiry:"期限前"};
+var TRIG_FULL={manual:"手動",input:"入力時",expiry:"期限前",unknown:"不明"};
 function cacheChart(days,max,label,series,tip){
   if(!days.length)return "";
   var W=Math.max(days.length,14),h="<svg viewBox=\"0 0 "+W+" 100\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\""+esc(label)+"\">";
@@ -440,13 +469,33 @@ function cacheChartBlock(days,title,series,maxOf,tip,legend){
     +cacheChart(days,max,title,series,tip)
     +"<div class=\"spaxis\"><span>"+esc(days.length?days[0].date:"")+"</span><span>最大 "+fmtTok(max)+" tokens/日</span><span>"+esc(days.length?days[days.length-1].date:"")+"</span></div></div>";
 }
+function fmtNet(v){v=Number(v)||0;return (v>0?"+":"")+fmtMoney(v)}
 function cacheEventRow(e){
   var ms=Date.parse(e.ts),ratio=e.before>0?Math.min(100,Math.max(0,e.after/e.before*100)):0;
   var trig=e.trigger&&TRIG[e.trigger]?"（"+TRIG[e.trigger]+"）":"";
+  var has=typeof e.net==="number",v=cacheVerdict(e),post=Number(e.postRequests)||0;
+  var be=typeof e.breakEven==="number"?(Math.round(e.breakEven*10)/10):null;
+  var tip=has?"節約 = 後続要求数 "+post+" × 捨てた tokens "+e.dropped+" × cacheRead単価 = "+fmtMoney(e.savings)+" ／ 損益 = 節約 − 再書込 = "+fmtMoney(e.savings)+" − "+fmtMoney(e.recacheCost)+" = "+fmtMoney(e.net):"損益データなし";
   return "<tr><td class=\"l\">"+esc(isNaN(ms)?e.ts:fmtTime(ms))+"</td><td class=\"l\">"+esc(e.project)+(e.sub?"<span class=\"badge\">サブ</span>":"")+"</td>"
     +"<td class=\"l\">"+esc(e.kind+trig)+"</td>"
     +"<td title=\""+e.before+" → "+e.after+"\">"+fmtTok(e.before)+" → "+fmtTok(e.after)+" <span class=\"bar\" title=\"after/before "+ratio.toFixed(0)+"%\"><i style=\"width:"+ratio.toFixed(1)+"%\"></i></span></td>"
-    +"<td title=\""+e.dropped+"\">"+fmtTok(e.dropped)+"</td><td title=\""+e.recache+"\">"+fmtTok(e.recache)+"</td><td>"+fmtMoney(e.recacheCost)+"</td></tr>";
+    +"<td title=\""+e.dropped+"\">"+fmtTok(e.dropped)+"</td><td title=\""+e.recache+"\">"+fmtTok(e.recache)+"</td><td>"+fmtMoney(e.recacheCost)+"</td>"
+    +"<td>"+(has?post:"–")+"</td><td>"+(be!==null?be:"–")+"</td>"
+    +"<td title=\""+esc(tip)+"\" class=\""+v.cls+"\">"+(has?fmtNet(e.net):"–")+(v.cls?"<span class=\"badge "+v.cls+"\">"+v.label+"</span>":"")+"</td></tr>";
+}
+// Daily relay net ($ = savings − re-cache cost): bars up (green) / down (red) from a zero line.
+function cacheNetChartBlock(days,title){
+  var max=days.reduce(function(a,d){var v=Math.abs(d.relayNet);return v>a?v:a},0);
+  var W=Math.max(days.length,14),h="<svg viewBox=\"0 0 "+W+" 100\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\""+esc(title)+"\">";
+  days.forEach(function(d,i){
+    h+="<g><title>"+esc(d.date+"  relay "+d.relays+"回 / 節約 "+fmtMoney(d.relaySavings)+" − 再書込 "+fmtMoney(d.relayCost)+" = 損益 "+fmtNet(d.relayNet))+"</title><rect class=\"hit\" x=\""+i+"\" y=\"0\" width=\"1\" height=\"100\"/>";
+    var bh=max?Math.abs(d.relayNet)/max*48:0;
+    if(bh>0)h+="<rect class=\""+(d.relayNet>=0?"k-pos":"k-neg")+"\" x=\""+(i+0.12).toFixed(2)+"\" y=\""+(d.relayNet>=0?50-bh:50).toFixed(2)+"\" width=\"0.76\" height=\""+bh.toFixed(2)+"\"/>";
+    h+="</g>";
+  });
+  h+="<line class=\"zero\" x1=\"0\" x2=\""+W+"\" y1=\"50\" y2=\"50\"/></svg>";
+  return "<div class=\"cchart\"><h4>"+esc(title)+"</h4><div class=\"cleg\"><span><i class=\"k-pos\"></i>黒字（節約 &gt; 再書込）</span><span><i class=\"k-neg\"></i>赤字</span></div>"+h
+    +"<div class=\"spaxis\"><span>"+esc(days.length?days[0].date:"")+"</span><span>最大 ±"+fmtMoney(max)+"/日</span><span>"+esc(days.length?days[days.length-1].date:"")+"</span></div></div>";
 }
 function cacheCard(big,unit,extra){
   return "<div class=\"sptot\"><span class=\"big\">"+big+"<span class=\"k\">"+unit+"</span></span>"+extra+"</div>";
@@ -474,6 +523,21 @@ function renderCache(){
     +cacheCard(t.compacts,"回 compaction",cacheKv("ドロップ合計",fmtTok(t.compactDropped),t.compactDropped)+cacheKv("再キャッシュ書込",fmtTok(t.compactRecache)+" / "+fmtMoney(t.compactRecacheCost),t.compactRecache))
     +cacheCard(t.misses,"件 cache miss",cacheKv("再処理",fmtTok(t.missTokens),t.missTokens)+cacheKv("推定コスト",fmtMoney(t.missCost))
       +cacheKv("TTL切れ",t.missTtl+"件 / "+fmtTok(t.missTtlTokens))+cacheKv("モデル切替",t.missModel+"件 / "+fmtTok(t.missModelTokens))+cacheKv("その他",oth+"件 / "+fmtTok(othTok)));
+  var hasNet=state.cache.some(function(r){return r.relaySavings!=null||r.compactSavings!=null})||state.cacheEvents.some(function(e){return typeof e.net==="number"});
+  function netCard(label,sav,cost,small,extra){
+    var net=sav-cost,cls=!hasNet?"":net>=0?"pos":"neg";
+    return "<div class=\"sptot"+(small?" small":"")+"\"><span class=\"big "+cls+"\" title=\"損益 = 節約 − 再書込\">"+(hasNet?fmtNet(net):"–")+"<span class=\"k\">"+label+"</span></span>"
+      +cacheKv("節約",hasNet?fmtMoney(sav):"–")+cacheKv("再書込",fmtMoney(cost))+"</div>"+(extra?"<div class=\"sptot small\" aria-label=\"トリガー別の損益\">"+extra+"</div>":"");
+  }
+  var nt=cacheNetByTrigger(evs),ntx="";
+  if(state.cacheEvents.length){
+    ["manual","input","expiry","unknown"].forEach(function(k){
+      var b=nt[k];if(k==="unknown"&&!b.count)return;
+      ntx+="<span title=\""+TRIG_FULL[k]+"\"><span class=\"k\">"+TRIG_FULL[k]+"</span>"+b.count+"件（黒字 "+b.profit+"） <span class=\""+(!hasNet?"":b.net>=0?"pos":"neg")+"\">"+(hasNet?fmtNet(b.net):"–")+"</span></span>";
+    });
+  }
+  h+=netCard("relay 損益（節約 − 再書込）",t.relaySavings,t.relayRecacheCost,false,ntx)
+    +netCard("compaction 損益",t.compactSavings,t.compactRecacheCost,true);
   var days=cacheDays(agg,sel);
   if(days.length){
     var a=cacheChartBlock(days,"日別「ドロップ vs 再キャッシュ」",[{key:"dropped",cls:"k-drop",grouped:true},{key:"recache",cls:"k-rc",grouped:true}],
@@ -484,18 +548,19 @@ function renderCache(){
       function(d){return d.missTokens},
       function(d){return d.date+"  miss "+d.misses+"件 / "+fmtTok(d.missTokens)+"（TTL "+fmtTok(d.missTtl)+" / モデル "+fmtTok(d.missModel)+" / その他 "+fmtTok(d.missOther)+"）  "+fmtMoney(d.missCost)},
       "<span><i class=\"k-ttl\"></i>TTL切れ</span><span><i class=\"k-mod\"></i>モデル切替</span><span><i class=\"k-oth\"></i>その他</span>");
-    h+="<div class=\"spgrid\">"+a+b+"</div>";
+    h+="<div class=\"spgrid\">"+a+b+cacheNetChartBlock(days,"日別「relay 損益 $」")+"</div>";
   }
   if(!evs.length){
     h+="<p class=\"empty\">この条件の relay / compaction はありません。</p>";
   }else{
     var shown=Math.min(evs.length,state.cacheLimit);
-    h+="<div class=\"sptbl\"><table class=\"sp\"><thead><tr><th class=\"l\">日時</th><th class=\"l\">プロジェクト</th><th class=\"l\">種別</th><th>before → after</th><th>ドロップ</th><th>再キャッシュ tokens</th><th>再キャッシュ $</th></tr></thead><tbody>";
+    h+="<div class=\"sptbl\"><table class=\"sp\"><thead><tr><th class=\"l\">日時</th><th class=\"l\">プロジェクト</th><th class=\"l\">種別</th><th>before → after</th><th>ドロップ</th><th>再キャッシュ tokens</th><th>再キャッシュ $</th><th title=\"relay / compaction 後、次の relay / compaction までの実リクエスト数\">後続要求数</th><th title=\"再書込コストを回収するのに必要な要求数（節約 = 後続要求数 × 捨てた tokens × cacheRead単価 が再書込以上になる点）\">損益分岐(要求)</th><th title=\"損益 = 節約 − 再書込。節約 = 後続要求数 × 捨てた tokens × cacheRead単価\">損益 $</th></tr></thead><tbody>";
     for(var i=0;i<shown;i++)h+=cacheEventRow(evs[i]);
     h+="</tbody></table></div>";
     if(evs.length>shown)h+="<button type=\"button\" id=\"cacheMore\" class=\"more cmore\">さらに表示（残り "+(evs.length-shown)+"件）</button>";
   }
-  h+="<p class=\"spnote\">cache miss = 直前の接頭辞の50%未満しか cacheRead できなかった要求（再処理 tokens と推定コストは書き直し分）。relay / compaction 後の最初の要求は miss に数えず、再キャッシュとして集計します。before は tokensBefore の推定値、ドロップ = Σ max(0, before − after)。範囲はカレンダー選択とプロジェクト絞り込みに従い、検索語は適用しません。</p>";
+  h+="<p class=\"spnote\">cache miss = 直前の接頭辞の50%未満しか cacheRead できなかった要求（再処理 tokens と推定コストは書き直し分）。relay / compaction 後の最初の要求は miss に数えず、再キャッシュとして集計します。before は tokensBefore の推定値、ドロップ = Σ max(0, before − after)。範囲はカレンダー選択とプロジェクト絞り込みに従い、検索語は適用しません。</p>"
+    +"<p class=\"spnote\">損益は反事実の概算です（relay しなかった場合、以後の各要求で「捨てた tokens」を余分に cacheRead していたと仮定。品質面や compaction を遅らせる効果は含まない）。節約 = 後続要求数 × 捨てた tokens × cacheRead単価、損益 = 節約 − 再書込。「未回収」は最後の compaction でセッションが進行中または終了したもの。</p>";
   body.innerHTML=h;
 }
 function refresh(){
