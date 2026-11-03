@@ -1,4 +1,5 @@
 //! Session index: jsonl parsing, cache (JSON-compatible with the TS extension), scanning.
+use crate::cachestat::{build_cache, load_relay_log, AsstRec, CacheDay, CacheEvent, CacheEventRow, CacheRow, CacheTracker, API_ANTHROPIC};
 use rayon::prelude::*;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ pub const SUBAGENT_MARK: &str = "Temp-pi-agent-";
 pub const SEARCH_TEXT_MAX: usize = 20000;
 pub const FIRST_PROMPT_MAX: usize = 200;
 const BIG_LINE: usize = 2000;
-const CACHE_VERSION: u64 = 2;
+const CACHE_VERSION: u64 = 3;
 /// How many parent hops to follow when folding a sub-agent session into its owner's project.
 const MAX_PARENT_HOPS: usize = 10;
 
@@ -194,6 +195,8 @@ pub struct DailyRow {
 pub struct SessionSpend {
     pub parent_session: String,
     pub daily: Vec<DailyRow>,
+    pub cache_daily: Vec<CacheDay>,
+    pub cache_events: Vec<CacheEventRow>,
 }
 
 /* ------------------------------------------------------------------ lenient line model */
@@ -246,6 +249,24 @@ mod lenient {
     }
     pub fn number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
         d.deserialize_any(NumV)
+    }
+
+    struct BoolV;
+    impl<'de> Visitor<'de> for BoolV {
+        type Value = Option<bool>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("any") }
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> { Ok(Some(v)) }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_none<E>(self) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> { drain_seq(a).map(|_| None) }
+        fn visit_map<A: MapAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> { drain_map(a).map(|_| None) }
+    }
+    pub fn boolean<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        d.deserialize_any(BoolV)
     }
 
     /// An object field: `Some(T)` when the JSON value is an object, `None` for anything else.
@@ -322,6 +343,8 @@ use lenient::{Content, Obj};
 struct Cost {
     #[serde(default, deserialize_with = "lenient::number")]
     total: Option<f64>,
+    #[serde(default, rename = "cacheWrite", deserialize_with = "lenient::number")]
+    cache_write: Option<f64>,
 }
 #[derive(Deserialize, Default)]
 struct Usage {
@@ -335,6 +358,8 @@ struct Usage {
     cache_read: Option<f64>,
     #[serde(default, rename = "cacheWrite", deserialize_with = "lenient::number")]
     cache_write: Option<f64>,
+    #[serde(default, rename = "cacheWrite1h", deserialize_with = "lenient::number")]
+    cache_write_1h: Option<f64>,
 }
 fn tokens(v: Option<f64>) -> u64 {
     match v {
@@ -357,6 +382,32 @@ struct Message {
     model: Option<String>,
     #[serde(default)]
     usage: Obj<Usage>,
+    #[serde(default, deserialize_with = "lenient::string")]
+    provider: Option<String>,
+    #[serde(default, deserialize_with = "lenient::string")]
+    api: Option<String>,
+    #[serde(default, rename = "stopReason", deserialize_with = "lenient::string")]
+    stop_reason: Option<String>,
+    /// request start (ms epoch)
+    #[serde(default, deserialize_with = "lenient::number")]
+    timestamp: Option<f64>,
+}
+#[derive(Deserialize, Default)]
+struct Details {
+    #[serde(default, deserialize_with = "lenient::boolean")]
+    relay: Option<bool>,
+}
+/// Only what the cache statistics need of a compaction line (the rest, `summary` / `systemMessage` ..., is skipped unparsed).
+#[derive(Deserialize, Default)]
+struct CompactionLine {
+    #[serde(default, deserialize_with = "lenient::string")]
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "lenient::string")]
+    id: Option<String>,
+    #[serde(default, rename = "tokensBefore", deserialize_with = "lenient::number")]
+    tokens_before: Option<f64>,
+    #[serde(default)]
+    details: Obj<Details>,
 }
 #[derive(Deserialize, Default)]
 struct Line {
@@ -366,6 +417,12 @@ struct Line {
     timestamp: Option<String>,
     #[serde(default, deserialize_with = "lenient::string")]
     id: Option<String>,
+    #[serde(default, rename = "parentId", deserialize_with = "lenient::string")]
+    parent_id: Option<String>,
+    #[serde(default, rename = "tokensBefore", deserialize_with = "lenient::number")]
+    tokens_before: Option<f64>,
+    #[serde(default)]
+    details: Obj<Details>,
     #[serde(default, deserialize_with = "lenient::string")]
     cwd: Option<String>,
     #[serde(default, deserialize_with = "lenient::string")]
@@ -421,6 +478,52 @@ fn peek_role(head: &str) -> Option<&str> {
     None
 }
 
+/// `"id":"x","parentId":"y"|null,` right after the `{"type":"..",` prefix (pi writes them in this order).
+/// Returns (id, parentId); None when the head does not look like that.
+pub(crate) fn peek_ids(head: &str) -> Option<(&str, Option<&str>)> {
+    let rest = head.strip_prefix("{\"type\":\"")?;
+    let rest = &rest[rest.find("\",")? + 2..];
+    let rest = rest.strip_prefix("\"id\":\"")?;
+    let end = rest.find('"')?;
+    let id = &rest[..end];
+    if id.is_empty() || id.contains('\\') {
+        return None;
+    }
+    let rest = rest[end + 1..].strip_prefix(",\"parentId\":")?;
+    if rest.starts_with("null") {
+        return Some((id, None));
+    }
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let parent = &rest[..end];
+    if parent.contains('\\') {
+        return None;
+    }
+    Some((id, Some(parent)))
+}
+
+/// `,"id":"x","parentId":"y"|null,"timestamp":"t"}` at the very end of a line (custom entries put the payload first).
+pub(crate) fn peek_ids_tail(tail: &str) -> Option<(&str, Option<&str>)> {
+    let s = tail.trim_end().strip_suffix('}')?.strip_suffix('"')?;
+    let s = s[..s.rfind("\"timestamp\":\"")?].strip_suffix(',')?;
+    let (s, parent) = match s.strip_suffix("null") {
+        Some(rest) if rest.ends_with(':') => (rest, None),
+        _ => {
+            let s = s.strip_suffix('"')?;
+            let open = s.rfind('"')?;
+            (&s[..open], Some(&s[open + 1..]))
+        }
+    };
+    let s = s.strip_suffix("\"parentId\":")?.strip_suffix(',')?.strip_suffix('"')?;
+    let open = s.rfind('"')?;
+    let id = &s[open + 1..];
+    s[..open].strip_suffix("\"id\":")?;
+    if id.is_empty() || id.contains('\\') || parent.is_some_and(|p| p.contains('\\')) {
+        return None;
+    }
+    Some((id, parent))
+}
+
 fn peek_timestamp(head: &str) -> Option<&str> {
     const KEY: &str = "\"timestamp\":\"";
     for (i, _) in head.match_indices(KEY) {
@@ -453,6 +556,29 @@ pub struct SessionAccumulator {
     saw_any: bool,
     parent_session: String,
     daily: HashMap<(String, String), DailyRow>,
+    cache: CacheTracker,
+}
+
+/// The valid assistant response behind `m` for the cache statistics (None: no usage / error / aborted / no tokens).
+fn asst_rec(m: &Message) -> Option<AsstRec> {
+    let u = m.usage.0.as_ref()?;
+    if matches!(m.stop_reason.as_deref(), Some("error" | "aborted")) {
+        return None;
+    }
+    let (input, cr, cw) = (tokens(u.input), tokens(u.cache_read), tokens(u.cache_write));
+    if input + cr + cw == 0 {
+        return None;
+    }
+    Some(AsstRec {
+        key: format!("{}\u{0}{}", m.provider.as_deref().unwrap_or(""), m.model.as_deref().unwrap_or("")),
+        anthropic: m.api.as_deref() == Some(API_ANTHROPIC),
+        start_ms: m.timestamp.filter(|t| t.is_finite()),
+        input,
+        cr,
+        cw,
+        cw1h: tokens(u.cache_write_1h),
+        cost_cw: num(u.cost.0.as_ref().and_then(|c| c.cache_write)),
+    })
 }
 
 impl SessionAccumulator {
@@ -493,11 +619,29 @@ impl SessionAccumulator {
                     } else {
                         true
                     };
-                    if skip {
-                        // not interesting: only peek the timestamp, never JSON-parse megabytes of tool output
+                    if ty == "compaction" {
+                        // a compaction line carries the whole system prompt: parse only the few fields we need
+                        if let Ok(c) = serde_json::from_slice::<CompactionLine>(line) {
+                            self.saw_any = true;
+                            if let Some(ts) = &c.timestamp {
+                                self.ended_at = ts.clone();
+                            }
+                            if let Some(id) = c.id.as_deref() {
+                                let relay = c.details.0.as_ref().and_then(|d| d.relay) == Some(true);
+                                self.cache.compaction(id, &self.ended_at, tokens(c.tokens_before), relay);
+                            }
+                            return;
+                        }
+                    } else if skip {
+                        // not interesting: only peek the timestamp (and the tree links), never JSON-parse megabytes of tool output
                         if let Some(ts) = peek_timestamp(&head) {
                             self.ended_at = ts.to_string();
                             self.saw_any = true;
+                        }
+                        // `id`/`parentId` sit right after `type` (messages) or at the very end (custom entries)
+                        let tail = String::from_utf8_lossy(&line[line.len() - 300..]);
+                        if let Some((id, parent)) = peek_ids(&head).or_else(|| peek_ids_tail(&tail)) {
+                            self.cache.other(id, parent);
                         }
                         return;
                     }
@@ -510,6 +654,11 @@ impl SessionAccumulator {
         self.saw_any = true;
         if let Some(ts) = &obj.timestamp {
             self.ended_at = ts.clone();
+        }
+        if ty != "session" {
+            if let Some(id) = obj.id.as_deref() {
+                self.track_cache(id, ty, &obj);
+            }
         }
         match ty {
             "session" => {
@@ -602,6 +751,23 @@ impl SessionAccumulator {
         }
     }
 
+    /// Feed the cache tracker with a (parsed) tree entry.
+    fn track_cache(&mut self, id: &str, ty: &str, obj: &Line) {
+        let parent = obj.parent_id.as_deref();
+        let ts = obj.timestamp.as_deref().unwrap_or(&self.ended_at);
+        match ty {
+            "compaction" => {
+                let relay = obj.details.0.as_ref().and_then(|d| d.relay) == Some(true);
+                self.cache.compaction(id, ts, tokens(obj.tokens_before), relay);
+            }
+            "message" => match obj.message.0.as_ref() {
+                Some(m) if m.role.as_deref() == Some("assistant") => self.cache.assistant(id, parent, ts, asst_rec(m)),
+                _ => self.cache.other(id, parent),
+            },
+            _ => self.cache.other(id, parent),
+        }
+    }
+
     pub fn finish(self, file: &str, folder: &str, mtime_ms: f64) -> Option<(SessionEntry, SessionSpend)> {
         if !self.saw_any {
             return None;
@@ -644,7 +810,39 @@ impl SessionAccumulator {
                 }
             }
         }
-        let spend = SessionSpend { parent_session: self.parent_session, daily: by_key.into_values().collect() };
+        let fallback_date = local_date(&started_at).unwrap_or_default();
+        let (days, mut events) = self.cache.finish();
+        let mut cache_days: BTreeMap<String, CacheDay> = BTreeMap::new();
+        for mut d in days {
+            if d.date.is_empty() {
+                d.date = fallback_date.clone();
+            }
+            match cache_days.get_mut(&d.date) {
+                Some(t) => {
+                    t.misses += d.misses;
+                    t.miss_tokens += d.miss_tokens;
+                    t.miss_cost += d.miss_cost;
+                    t.miss_ttl += d.miss_ttl;
+                    t.miss_ttl_tokens += d.miss_ttl_tokens;
+                    t.miss_model += d.miss_model;
+                    t.miss_model_tokens += d.miss_model_tokens;
+                }
+                None => {
+                    cache_days.insert(d.date.clone(), d);
+                }
+            }
+        }
+        for e in &mut events {
+            if e.date.is_empty() {
+                e.date = fallback_date.clone();
+            }
+        }
+        let spend = SessionSpend {
+            parent_session: self.parent_session,
+            daily: by_key.into_values().collect(),
+            cache_daily: cache_days.into_values().collect(),
+            cache_events: events,
+        };
         Some((SessionEntry {
             id: if id.is_empty() { "session".to_string() } else { id },
             file: file.to_string(),
@@ -724,6 +922,10 @@ struct CachedFile {
     parent_session: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     daily: Vec<DailyRow>,
+    #[serde(rename = "cacheDaily", default, skip_serializing_if = "Vec::is_empty")]
+    cache_daily: Vec<CacheDay>,
+    #[serde(rename = "cacheEvents", default, skip_serializing_if = "Vec::is_empty")]
+    cache_events: Vec<CacheEventRow>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -787,6 +989,9 @@ pub struct ScanResult {
     pub entries: Vec<SessionEntry>,
     /// Spend of all sessions, sub-agents included.
     pub spend: Vec<SpendRow>,
+    /// Prompt-cache misses per (date, project, sub) and relay / compaction events.
+    pub cache: Vec<CacheRow>,
+    pub cache_events: Vec<CacheEvent>,
     pub total: usize,
     pub parsed: usize,
     pub cached: usize,
@@ -860,7 +1065,12 @@ pub fn scan_sessions(opts: &ScanOptions) -> ScanResult {
                 let mut e = c.entry.clone();
                 e.file = f.key.clone();
                 e.folder = f.folder.clone();
-                all.push(Scanned { entry: e, spend: SessionSpend { parent_session: c.parent_session.clone(), daily: c.daily.clone() } });
+                all.push(Scanned { entry: e, spend: SessionSpend {
+                    parent_session: c.parent_session.clone(),
+                    daily: c.daily.clone(),
+                    cache_daily: c.cache_daily.clone(),
+                    cache_events: c.cache_events.clone(),
+                } });
             }
             _ => to_parse.push(f),
         }
@@ -884,7 +1094,11 @@ pub fn scan_sessions(opts: &ScanOptions) -> ScanResult {
         if let Some((e, sp)) = e {
             kept.insert(
                 f.key.clone(),
-                CachedFile { mtime_ms: f.mtime_ms, size: f.size, entry: e.clone(), parent_session: sp.parent_session.clone(), daily: sp.daily.clone() },
+                CachedFile { mtime_ms: f.mtime_ms, size: f.size, entry: e.clone(), parent_session: sp.parent_session.clone(),
+                    daily: sp.daily.clone(),
+                    cache_daily: sp.cache_daily.clone(),
+                    cache_events: sp.cache_events.clone(),
+                },
             );
             all.push(Scanned { entry: e, spend: sp });
         }
@@ -893,12 +1107,14 @@ pub fn scan_sessions(opts: &ScanOptions) -> ScanResult {
         let _ = save_cache(opts.cache_path, &CacheFile { version: CACHE_VERSION, files: kept });
     }
     let spend = build_spend(&all);
+    let relay_log = opts.sessions_dir.parent().map(|a| load_relay_log(&a.join("context-relay").join("log.jsonl"))).unwrap_or_default();
+    let (cache, cache_events) = build_cache(&all, &relay_log);
     let entries: Vec<SessionEntry> = all
         .into_iter()
         .filter(|s| opts.include_subagents || !is_subagent_folder(&s.entry.folder))
         .map(|s| s.entry)
         .collect();
-    ScanResult { entries, spend, total, parsed, cached, skipped_folders, ms: t0.elapsed().as_millis() }
+    ScanResult { entries, spend, cache, cache_events, total, parsed, cached, skipped_folders, ms: t0.elapsed().as_millis() }
 }
 
 /* ------------------------------------------------------------------ spend */
@@ -925,10 +1141,10 @@ fn path_key(p: &str) -> String {
     if cfg!(windows) { n.to_lowercase() } else { n }
 }
 
-/// Aggregate the daily spend of ALL sessions (sub-agents included). A sub-agent session counts for the first
-/// non-sub-agent session found by following `parentSession` (at most `MAX_PARENT_HOPS` hops, cycle-safe);
-/// when the chain breaks it stays under its own project. Normal sessions always count for themselves.
-pub fn build_spend(all: &[Scanned]) -> Vec<SpendRow> {
+/// The project each session counts for. A sub-agent session counts for the first non-sub-agent session found by
+/// following `parentSession` (at most `MAX_PARENT_HOPS` hops, cycle-safe); when the chain breaks it stays under its
+/// own project. Normal sessions always count for themselves. Shared by `build_spend` and `build_cache`.
+pub fn owner_projects(all: &[Scanned]) -> Vec<&str> {
     let by_file: HashMap<String, usize> = all.iter().enumerate().map(|(i, s)| (path_key(&s.entry.file), i)).collect();
     let is_sub = |i: usize| is_subagent_folder(&all[i].entry.folder);
     let owner_project = |start: usize| -> &str {
@@ -952,12 +1168,19 @@ pub fn build_spend(all: &[Scanned]) -> Vec<SpendRow> {
         }
         own
     };
+    (0..all.len()).map(owner_project).collect()
+}
+
+/// Aggregate the daily spend of ALL sessions (sub-agents included, folded into their owner project).
+pub fn build_spend(all: &[Scanned]) -> Vec<SpendRow> {
+    let owners = owner_projects(all);
+    let is_sub = |i: usize| is_subagent_folder(&all[i].entry.folder);
     let mut agg: BTreeMap<(String, String, String, bool), SpendRow> = BTreeMap::new();
     for (i, s) in all.iter().enumerate() {
         if s.spend.daily.is_empty() {
             continue;
         }
-        let project = owner_project(i);
+        let project = owners[i];
         let sub = is_sub(i);
         for d in &s.spend.daily {
             let row = agg
@@ -1310,6 +1533,7 @@ pub mod tests {
             spend: SessionSpend {
                 parent_session: parent.into(),
                 daily: vec![DailyRow { date: "2026-10-01".into(), model: "m".into(), cost, input: 1, output: 2, cache_read: 3, cache_write: 4, messages: 1 }],
+                ..Default::default()
             },
         }
     }
@@ -1409,7 +1633,7 @@ pub mod tests {
         let r1 = scan_sessions(&opts);
         assert_eq!(r1.parsed, 1);
         let c = load_cache(&cache);
-        assert_eq!(c.version, 2);
+        assert_eq!(c.version, 3);
         let cf = c.files.values().next().unwrap();
         assert_eq!(cf.parent_session, "/x/y.jsonl");
         assert_eq!(cf.daily.len(), 1);

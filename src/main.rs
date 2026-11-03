@@ -1,6 +1,7 @@
 //! pi-history: browse past Pi sessions in the browser (list + search + calendar filter).
 //! Port of the `session-history.ts` Pi extension as a standalone executable. See README.md.
 mod agentdir;
+mod cachestat;
 mod config;
 mod dialog;
 mod export;
