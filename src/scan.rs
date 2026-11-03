@@ -1038,6 +1038,8 @@ pub mod tests {
         let f = &c.files["C:\\x\\a.jsonl"];
         assert_eq!(f.size, 1981224);
         assert_eq!(f.entry.messages, 3);
+        // mtimeMs must survive a parse/serialize round trip bit-exactly (TS compares with ===)
+        assert!(serde_json::to_string(&c).unwrap().contains("\"mtimeMs\":1792725227205.3103"));
         assert_eq!(f.entry.started_at, "2026-10-23T02:25:22.208Z");
         let out = serde_json::to_value(&f.entry).unwrap();
         assert_eq!(out["firstPrompt"], "t");
