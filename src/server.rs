@@ -1,6 +1,6 @@
 //! 127.0.0.1 HTTP server: list page, /api/index, /session/<id>, plus token-protected control endpoints.
 use crate::export::{ensure_session_html, Exporter};
-use crate::scan::{build_index, now_iso, scan_sessions, Index, ScanOptions, ScanResult, SessionEntry};
+use crate::scan::{build_index, now_iso, scan_sessions, Index, ScanOptions, ScanResult, SessionEntry, SpendRow};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,13 +22,19 @@ struct IndexJson<'a> {
     generated_at: &'a str,
     include_subagents: bool,
     entries: &'a [SessionEntry],
+    spend: &'a [SpendRow],
 }
 
 impl Snapshot {
+    #[allow(dead_code)]
     pub fn new(entries: Vec<SessionEntry>, include_subagents: bool) -> Snapshot {
+        Snapshot::with_spend(entries, Vec::new(), include_subagents)
+    }
+
+    pub fn with_spend(entries: Vec<SessionEntry>, spend: Vec<SpendRow>, include_subagents: bool) -> Snapshot {
         let index = build_index(entries);
         let generated_at = now_iso();
-        let json = serde_json::to_vec(&IndexJson { generated_at: &generated_at, include_subagents, entries: &index.entries }).unwrap_or_default();
+        let json = serde_json::to_vec(&IndexJson { generated_at: &generated_at, include_subagents, entries: &index.entries, spend: &spend }).unwrap_or_default();
         Snapshot { index, json }
     }
 }
@@ -69,7 +75,7 @@ pub fn scan_snapshot(
 ) -> (Snapshot, ScanSummary) {
     let res = scan_sessions(&ScanOptions { sessions_dir, cache_path, include_subagents, on_progress: progress });
     let summary = summarize(&res, include_subagents);
-    (Snapshot::new(res.entries, include_subagents), summary)
+    (Snapshot::with_spend(res.entries, res.spend, include_subagents), summary)
 }
 
 impl AppState {

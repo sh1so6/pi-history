@@ -1,8 +1,8 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pi セッション履歴</title><style>
-:root{color-scheme:light dark;--bg:#fafafa;--fg:#1d1f23;--mut:#6b7280;--card:#fff;--bd:#d9dce1;--ac:#2563eb;--acbg:#dbeafe}
-@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e5e7eb;--mut:#9aa3b2;--card:#1c1f25;--bd:#333943;--ac:#6ea0ff;--acbg:#1e3a6e}}
+:root{color-scheme:light dark;--bg:#fafafa;--fg:#1d1f23;--mut:#6b7280;--card:#fff;--bd:#d9dce1;--ac:#2563eb;--acbg:#dbeafe;--ac2:#d97706}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e5e7eb;--mut:#9aa3b2;--card:#1c1f25;--bd:#333943;--ac:#6ea0ff;--acbg:#1e3a6e;--ac2:#fbbf24}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif}
 header{padding:12px 20px;border-bottom:1px solid var(--bd);display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
@@ -53,6 +53,41 @@ button:disabled{opacity:.5;cursor:default}
 .act button{font-size:12px;padding:2px 6px;white-space:nowrap}
 .more{display:block;margin:16px auto}
 .empty{color:var(--mut);padding:24px 0;text-align:center}
+.spend{margin:0 0 12px;padding:8px 12px}
+.spend>summary{cursor:pointer;font-weight:600}
+.spend>summary .sc{font-weight:400;color:var(--mut);font-size:12px;margin-left:8px}
+.sptot{display:flex;flex-wrap:wrap;gap:4px 18px;margin:8px 0;align-items:baseline}
+.sptot .big{font-size:20px;font-weight:700}
+.sptot span{white-space:nowrap}
+.sptot .k{color:var(--mut);font-size:12px;margin-right:4px}
+[hidden]{display:none!important}
+.spgrid{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;margin-top:10px;align-items:start}
+@media (min-width:1150px){.spgrid{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr)}}
+.sptbl{overflow:auto;max-height:300px;margin-top:10px}
+table.sp thead th{position:sticky;top:0;background:var(--card)}
+table.sp{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+table.sp th,table.sp td{padding:3px 8px;border-bottom:1px solid var(--bd);text-align:right;white-space:nowrap}
+table.sp th{color:var(--mut);font-weight:400;font-size:12px}
+table.sp .l{text-align:left}
+table.sp tr.pj{cursor:pointer}
+table.sp tr.pj:hover{background:color-mix(in srgb,var(--ac) 8%,transparent)}
+table.sp tr.md td{color:var(--mut);font-size:13px}
+table.sp tr.md td.l{padding-left:28px}
+table.sp .lk{border:0;background:none;padding:0;text-align:left;font-weight:600;max-width:240px;overflow:hidden;text-overflow:ellipsis}
+table.sp .lk:hover{text-decoration:underline}
+table.sp .tg{border:0;background:none;padding:0 4px;color:var(--mut)}
+table.sp .tg[aria-expanded=true]{transform:rotate(90deg)}
+.bar{display:inline-block;width:80px;height:8px;background:color-mix(in srgb,var(--ac) 15%,transparent);border-radius:4px;overflow:hidden;vertical-align:middle}
+.bar i{display:block;height:100%;background:var(--ac)}
+.spnote{color:var(--mut);font-size:12px;margin:6px 0 0}
+.spchart{margin-top:6px}
+.spchart svg{display:block;width:100%;height:110px;background:color-mix(in srgb,var(--ac) 4%,transparent);border-radius:4px}
+.spchart .hit{fill:transparent}
+.spchart .hit:hover{fill:color-mix(in srgb,var(--ac) 14%,transparent)}
+.spchart .b{fill:var(--ac);pointer-events:none}
+.spchart .bs{fill:var(--ac2);pointer-events:none}
+.spaxis{display:flex;justify-content:space-between;color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
+.spaxis .mx{order:-1}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:6px 14px;border-radius:6px;opacity:0;pointer-events:none;transition:opacity .15s}
 #toast.show{opacity:.92}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
@@ -72,6 +107,7 @@ button:disabled{opacity:.5;cursor:default}
 <select id="sort" aria-label="並び替え"><option value="new">新しい順</option><option value="old">古い順</option><option value="cost">コスト順</option><option value="msgs">メッセージ数順</option></select>
 </div>
 <div class="controls"><span id="range" class="chip" hidden><span id="rangeText"></span></span><span id="projChip" class="chip" hidden><span id="projChipText"></span><button type="button" id="projChipClear" aria-label="プロジェクト絞り込みを解除">×</button></span></div>
+<details id="spend" class="spend panel" open><summary>期間の支出<span id="spendScope" class="sc"></span></summary><div id="spendBody"></div></details>
 <p id="summary" aria-live="polite">読み込み中…</p>
 <div id="list"></div>
 </main>
@@ -91,7 +127,7 @@ function haystack(e){return [e.title,e.firstPrompt,e.searchText,e.project,e.cwd]
 function matchTokens(hay,tokens){for(var i=0;i<tokens.length;i++){if(hay.indexOf(tokens[i])<0)return false}return true}
 function rangeLabel(sel){
   if(!sel)return "";
-  return sel.start===sel.end?sel.start:sel.start+"\u301c"+sel.end;
+  return sel.start===sel.end?sel.start:sel.start+"〜"+sel.end;
 }
 function nextSelection(sel,key,shift){
   if(shift&&sel&&sel.anchor){
@@ -117,11 +153,64 @@ function sortEntries(list,mode){
   else a.sort(function(x,y){return y._ms-x._ms});
   return a;
 }
+function fmtMoney(c){
+  var v=Number(c)||0,neg=v<0;if(neg)v=-v;
+  var p=v.toFixed(2).split("."),ip=p[0].replace(/\B(?=(\d{3})+(?!\d))/g,",");
+  return (neg?"-":"")+"$"+ip+"."+p[1];
+}
+function fmtTok(n){
+  n=Number(n)||0;
+  if(n>=999500)return (n/1e6).toFixed(1)+"M";
+  if(n>=1e4)return Math.round(n/1e3)+"k";
+  if(n>=1e3)return (n/1e3).toFixed(1)+"k";
+  return String(Math.round(n));
+}
+function dateKeysBetween(lo,hi){
+  var out=[];if(!lo||!hi||lo>hi)return out;
+  var p=lo.split("-");
+  for(var i=0;i<3700;i++){
+    var k=dateKey(new Date(+p[0],+p[1]-1,+p[2]+i).getTime());
+    out.push(k);if(k>=hi)break;
+  }
+  return out;
+}
+function spendZero(){return {cost:0,input:0,output:0,cacheRead:0,cacheWrite:0,messages:0,subCost:0}}
+function spendAdd(t,r){
+  t.cost+=r.cost||0;t.input+=r.input||0;t.output+=r.output||0;t.cacheRead+=r.cacheRead||0;t.cacheWrite+=r.cacheWrite||0;t.messages+=r.messages||0;
+  if(r.sub)t.subCost+=r.cost||0;
+}
+// Pure: rows = /api/index `spend`, sel = {start,end}|null (local dates), projOk = function(project)->bool.
+// The search text never applies here. Returns totals, per project (with per model), per model and per day.
+function aggregateSpend(rows,sel,projOk){
+  var total=spendZero(),pj={},md={},days={};
+  for(var i=0;i<(rows||[]).length;i++){
+    var r=rows[i];
+    if(sel&&!inRange(r.date,sel.start,sel.end))continue;
+    if(projOk&&!projOk(r.project))continue;
+    spendAdd(total,r);
+    var p=pj[r.project]||(pj[r.project]=Object.assign(spendZero(),{project:r.project,models:{}}));
+    spendAdd(p,r);
+    spendAdd(p.models[r.model]||(p.models[r.model]=Object.assign(spendZero(),{model:r.model})),r);
+    spendAdd(md[r.model]||(md[r.model]=Object.assign(spendZero(),{model:r.model})),r);
+    if(r.date)spendAdd(days[r.date]||(days[r.date]=spendZero()),r);
+  }
+  var byCost=function(a,b){return (b.cost-a.cost)||((a.project||a.model||"")<(b.project||b.model||"")?-1:1)};
+  var projects=Object.keys(pj).map(function(k){var p=pj[k];p.models=Object.keys(p.models).map(function(m){return p.models[m]}).sort(byCost);return p}).sort(byCost);
+  var models=Object.keys(md).map(function(k){return md[k]}).sort(byCost);
+  return {total:total,projects:projects,models:models,days:days};
+}
+// Pure: chart data for each day of the range (selection, else first..last day with data).
+function spendDays(agg,sel){
+  var keys=Object.keys(agg.days).sort(),lo,hi;
+  if(sel){lo=sel.start;hi=sel.end||sel.start;if(lo>hi){var t=lo;lo=hi;hi=t}}
+  else if(keys.length){lo=keys[0];hi=keys[keys.length-1]}
+  return dateKeysBetween(lo,hi).map(function(k){var d=agg.days[k];return {date:k,cost:d?d.cost:0,subCost:d?d.subCost:0}});
+}
 function resumeCommand(file){return "pi --session "+(/\s/.test(file)?"\""+file+"\"":file)}
 
 (function(){
 var MAX=1000;
-var state={entries:[],project:"",projSub:"",q:"",sort:"new",sel:null,limit:MAX,month:null,focusKey:""};
+var state={entries:[],spend:[],expanded:{},project:"",projSub:"",q:"",sort:"new",sel:null,limit:MAX,month:null,focusKey:""};
 var $=function(id){return document.getElementById(id)};
 var ESC={"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"};
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return ESC[c]})}
@@ -156,6 +245,7 @@ function compute(){
 function buildProjects(){
   var m={};
   state.entries.forEach(function(e){m[e.project]=(m[e.project]||0)+1});
+  state.spend.forEach(function(r){if(!(r.project in m))m[r.project]=0});
   var names=Object.keys(m).sort(function(a,b){return m[b]-m[a]||(a<b?-1:1)});
   var html="<option value=\"\">すべて ("+state.entries.length+")</option>";
   names.forEach(function(n){html+="<option value=\""+esc(n)+"\">"+esc(n)+" ("+m[n]+")</option>"});
@@ -208,16 +298,74 @@ function renderList(list){
   if(list.length>shown)h+="<button type=\"button\" id=\"more\" class=\"more\">さらに表示（残り "+(list.length-shown)+"件）</button>";
   $("list").innerHTML=h;
 }
+function spendProjOk(p){
+  if(state.project&&p!==state.project)return false;
+  if(state.projSub&&p.toLowerCase().indexOf(state.projSub.toLowerCase())<0)return false;
+  return true;
+}
+function spendChart(days,max){
+  if(!days.length)return "";
+  var W=Math.max(days.length,14),h="<svg viewBox=\"0 0 "+W+" 100\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\"日別の支出\">";
+  days.forEach(function(d,i){
+    var bh=max?d.cost/max*98:0,sh=max?d.subCost/max*98:0;
+    h+="<g><title>"+esc(d.date+"  "+fmtMoney(d.cost)+(d.subCost?"（うちサブ "+fmtMoney(d.subCost)+"）":""))+"</title><rect class=\"hit\" x=\""+i+"\" y=\"0\" width=\"1\" height=\"100\"/>";
+    if(bh>0)h+="<rect class=\"b\" x=\""+(i+0.12).toFixed(2)+"\" y=\""+(100-bh).toFixed(2)+"\" width=\"0.76\" height=\""+bh.toFixed(2)+"\"/>";
+    if(sh>0)h+="<rect class=\"bs\" x=\""+(i+0.12).toFixed(2)+"\" y=\""+(100-sh).toFixed(2)+"\" width=\"0.76\" height=\""+sh.toFixed(2)+"\"/>";
+    h+="</g>";
+  });
+  return h+"</svg>";
+}
+function tokCells(t){
+  return "<td title=\""+t.input+"\">"+fmtTok(t.input)+"</td><td title=\""+t.output+"\">"+fmtTok(t.output)+"</td><td title=\""+t.cacheRead+"\">"+fmtTok(t.cacheRead)+"</td><td title=\""+t.cacheWrite+"\">"+fmtTok(t.cacheWrite)+"</td><td>"+t.messages+"</td>";
+}
+function renderSpend(){
+  var sel=state.sel,agg=aggregateSpend(state.spend,sel,spendProjOk),t=agg.total;
+  $("spendScope").textContent=(sel?rangeLabel(sel):"全期間")+(state.project?" / "+state.project:state.projSub?" / "+state.projSub:"")+" — "+fmtMoney(t.cost);
+  if(!$("spend").open)return;
+  if(!state.spend.length){$("spendBody").innerHTML="<p class=\"empty\">支出データがありません。</p>";return}
+  var h="<div class=\"sptot\"><span class=\"big\">"+fmtMoney(t.cost)+"</span>"
+    +"<span><span class=\"k\">in</span>"+fmtTok(t.input)+"</span><span><span class=\"k\">out</span>"+fmtTok(t.output)+"</span>"
+    +"<span><span class=\"k\">cacheRead</span>"+fmtTok(t.cacheRead)+"</span><span><span class=\"k\">cacheWrite</span>"+fmtTok(t.cacheWrite)+"</span>"
+    +"<span><span class=\"k\">メッセージ</span>"+t.messages+"</span>"
+    +"<span><span class=\"k\">うちサブエージェント</span>"+fmtMoney(t.subCost)+"</span></div>";
+  if(!agg.projects.length){
+    h+="<p class=\"empty\">この条件の支出はありません。</p>";
+  }else{
+    var pt="",mt="",ch="";
+    var th="<th>金額</th><th>割合</th><th>in</th><th>out</th><th>cacheRead</th><th>cacheWrite</th><th>msgs</th><th>うちサブ</th>";
+    pt+="<div class=\"sptbl\"><table class=\"sp\"><thead><tr><th></th><th class=\"l\">プロジェクト</th>"+th+"</tr></thead><tbody>";
+    agg.projects.forEach(function(p){
+      var open=!!state.expanded[p.project],pct=t.cost>0?p.cost/t.cost*100:0;
+      pt+="<tr class=\"pj\" data-pj=\""+esc(p.project)+"\"><td><button type=\"button\" class=\"tg\" data-tg=\""+esc(p.project)+"\" aria-expanded=\""+open+"\" aria-label=\"モデル別内訳を展開: "+esc(p.project)+"\">▸</button></td>"
+        +"<td class=\"l\"><button type=\"button\" class=\"lk\" data-pj=\""+esc(p.project)+"\" title=\"このプロジェクトで絞り込む\">"+esc(p.project)+"</button></td>"
+        +"<td>"+fmtMoney(p.cost)+"</td><td><span class=\"bar\" title=\""+pct.toFixed(1)+"%\"><i style=\"width:"+pct.toFixed(1)+"%\"></i></span></td>"+tokCells(p)+"<td>"+(p.subCost?fmtMoney(p.subCost):"–")+"</td></tr>";
+      if(open)p.models.forEach(function(m){
+        pt+="<tr class=\"md\"><td></td><td class=\"l\">"+esc(m.model)+"</td><td>"+fmtMoney(m.cost)+"</td><td></td>"+tokCells(m)+"<td>"+(m.subCost?fmtMoney(m.subCost):"–")+"</td></tr>";
+      });
+    });
+    pt+="</tbody></table></div>";
+    mt+="<div class=\"sptbl\"><table class=\"sp\"><thead><tr><th class=\"l\">モデル別合計</th><th>金額</th><th>in</th><th>out</th><th>cacheRead</th><th>cacheWrite</th><th>msgs</th><th>うちサブ</th></tr></thead><tbody>";
+    agg.models.forEach(function(m){mt+="<tr><td class=\"l\">"+esc(m.model)+"</td><td>"+fmtMoney(m.cost)+"</td>"+tokCells(m)+"<td>"+(m.subCost?fmtMoney(m.subCost):"–")+"</td></tr>"});
+    mt+="</tbody></table></div>";
+    var days=spendDays(agg,sel),max=days.reduce(function(a,d){return d.cost>a?d.cost:a},0);
+    ch="<div class=\"spchart\">"+spendChart(days,max)+"<div class=\"spaxis\"><span>"+esc(days.length?days[0].date:"")+"</span><span>最大 "+fmtMoney(max)+"/日（橙: うちサブエージェント）</span><span>"+esc(days.length?days[days.length-1].date:"")+"</span></div></div>";
+    h+="<div class=\"spgrid\"><div>"+ch+"</div>"+mt+"</div>"+pt;
+  }
+  h+="<p class=\"spnote\">日付はメッセージのローカル日。範囲はカレンダー選択（未選択は全期間）とプロジェクト絞り込みに従い、検索語は適用しません。サブエージェントの支出は起動元セッションのプロジェクトに合算。</p>";
+  $("spendBody").innerHTML=h;
+}
 function refresh(){
   var r=compute();
   renderCalendar(r.counts);
   renderList(r.list);
+  renderSpend();
 }
 function setMonthFromKey(key){var p=key.split("-");state.month={y:+p[0],m:+p[1]-1}}
 function shiftMonth(n){var d=new Date(state.month.y,state.month.m+n,1);state.month={y:d.getFullYear(),m:d.getMonth()};refresh()}
 function keyAdd(key,n){var p=key.split("-");return dateKey(new Date(+p[0],+p[1]-1,+p[2]+n).getTime())}
 function init(data){
   state.entries=prepare(data.entries||[]);
+  state.spend=data.spend||[];
   var q=new URLSearchParams(location.search);
   state.projSub=q.get("project")||"";
   buildProjects();
@@ -246,6 +394,18 @@ $("cal").addEventListener("keydown",function(ev){
   ev.preventDefault();
   var nk=keyAdd(b.getAttribute("data-key"),step);
   setMonthFromKey(nk);state.focusKey=nk;refresh();
+});
+$("spend").addEventListener("toggle",function(){renderSpend()});
+$("spendBody").addEventListener("click",function(ev){
+  var tg=ev.target.closest("[data-tg]");
+  if(tg){var k=tg.getAttribute("data-tg");state.expanded[k]=!state.expanded[k];renderSpend();return}
+  var row=ev.target.closest("tr.pj");
+  if(row){
+    var name=row.getAttribute("data-pj"),s=$("project");
+    state.project=name;state.projSub="";state.limit=MAX;
+    if(s.value!==name){buildProjects()}
+    s.value=name;refresh();
+  }
 });
 $("list").addEventListener("click",function(ev){
   var c=ev.target.closest("[data-copy]");
