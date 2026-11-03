@@ -3,6 +3,7 @@
 mod config;
 mod export;
 mod inject;
+mod prefs;
 mod scan;
 mod server;
 
@@ -176,6 +177,7 @@ fn start_server(agent: &Path, include: bool) -> Result<(Arc<tiny_http::Server>, 
     let data_dir = agent.join("session-history");
     let sessions_dir = agent.join("sessions");
     let cache_path = data_dir.join("cache.json");
+    let prefs_path = data_dir.join("ui.json");
     let (snap, summary) = scan_snapshot(&sessions_dir, &cache_path, include, Some(&|d, t| log_progress(d, t)));
     let tserver = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| format!("could not start server: {e}"))?;
     let port = tserver.server_addr().to_ip().map(|a| a.port()).ok_or("no ip address")?;
@@ -189,6 +191,8 @@ fn start_server(agent: &Path, include: bool) -> Result<(Arc<tiny_http::Server>, 
         sessions_dir,
         cache_path,
         html_dir: data_dir.join("html"),
+        prefs: RwLock::new(prefs::load(&prefs_path)),
+        prefs_path,
         exporter: Box::new(export::export_with_pi),
         token,
         port,

@@ -10,7 +10,14 @@
 body { font-family: var(--pi-mono); font-size: 13px; }
 
 /* the page scrolls, not #content (its height is unbounded); overflow:auto there would stop position:sticky from working */
-#content { overflow-y: visible; }
+/* #content is the right-hand column only; the sidebar keeps the export's font. --ph-* come from the Aa popover
+   (saved prefs), unset = the defaults below. Spacing that the export derives from --line-height follows the mono size. */
+#content {
+  overflow-y: visible;
+  font-family: var(--ph-mono, var(--pi-mono));
+  font-size: var(--ph-mono-size, 13px);
+  --line-height: max(22px, calc(var(--ph-mono-size, 13px) * 1.7));
+}
 
 /* reading width and prose */
 @media (min-width: 901px) {
@@ -18,17 +25,17 @@ body { font-family: var(--pi-mono); font-size: 13px; }
 }
 .assistant-text, .user-message .markdown-content, .user-message > div:not(.message-timestamp):not(.message-images),
 .branch-summary .markdown-content, .hook-message .markdown-content, .compaction-content, .skill-invocation-content {
-  font-family: var(--pi-sans);
-  font-size: 14.5px;
-  line-height: 1.75;
+  font-family: var(--ph-font, var(--pi-sans));
+  font-size: var(--ph-font-size, 14.5px);
+  line-height: var(--ph-line, 1.75);
   overflow-wrap: anywhere;
 }
 .markdown-content p + p { margin-top: 0.8em; }
-.markdown-content ul, .markdown-content ol { margin: 0.5em 0; line-height: 1.7; }
+.markdown-content ul, .markdown-content ol { margin: 0.5em 0; line-height: var(--ph-line, 1.7); }
 .markdown-content li + li { margin-top: 0.2em; }
 .markdown-content code, .markdown-content pre, .markdown-content pre code {
-  font-family: var(--pi-mono);
-  font-size: 13px;
+  font-family: var(--ph-mono, var(--pi-mono));
+  font-size: var(--ph-mono-size, 13px);
   line-height: 1.55;
 }
 .markdown-content pre { background: var(--pi-tint); border: 1px solid var(--pi-line); border-radius: 4px; padding: 8px 12px; }
@@ -58,7 +65,7 @@ body { font-family: var(--pi-mono); font-size: 13px; }
 
 /* thinking: dim, click a block to open/close it */
 .thinking-block { cursor: pointer; border-left: 2px solid var(--pi-line); margin: 6px 0 6px 12px; }
-.thinking-block .thinking-text { font-family: var(--pi-sans); line-height: 1.65; padding-top: 4px; padding-bottom: 4px; }
+.thinking-block .thinking-text { font-family: var(--ph-font, var(--pi-sans)); line-height: var(--ph-line, 1.65); padding-top: 4px; padding-bottom: 4px; }
 .thinking-block .thinking-collapsed { padding-top: 2px; padding-bottom: 2px; }
 .thinking-collapsed::after { content: "  ▸ 展開"; opacity: 0.7; font-style: normal; font-size: 11px; }
 .thinking-block.pi-open .thinking-text { display: block !important; }
@@ -92,3 +99,31 @@ body { font-family: var(--pi-mono); font-size: 13px; }
 #pi-bar button[aria-pressed="true"] { color: var(--text); border-color: var(--text); }
 @media (max-width: 900px) { #pi-bar { padding-left: 44px; } }
 @media print { #pi-bar { display: none !important; } }
+
+/* Aa: font settings popover in the summary bar */
+#pi-bar .pi-fontbtn { font-weight: 600; }
+#pi-bar .pi-fontbtn[aria-expanded="true"] { color: var(--text); border-color: var(--text); }
+#pi-font-pop {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 6;
+  width: min(360px, calc(100vw - 24px)); padding: 10px 12px;
+  display: grid; grid-template-columns: auto 1fr; gap: 8px 10px; align-items: center;
+  background: var(--body-bg, Canvas); color: var(--text);
+  border: 1px solid var(--pi-line); border-radius: 6px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  font-family: var(--pi-sans); font-size: 12px; line-height: 1.4; text-align: left;
+}
+#pi-font-pop[hidden] { display: none; }
+#pi-font-pop h3 { grid-column: 1 / -1; margin: 4px 0 0; font-size: 12px; font-weight: 600; color: var(--dim); }
+#pi-font-pop h3:first-child { margin-top: 0; }
+#pi-font-pop label { color: var(--dim); white-space: nowrap; }
+#pi-font-pop .pi-ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+#pi-font-pop .pi-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+#pi-font-pop select, #pi-font-pop input[type="text"] {
+  width: 100%; min-width: 0; font: inherit; padding: 2px 6px; color: var(--text);
+  background: var(--container-bg, transparent); border: 1px solid var(--pi-line); border-radius: 3px;
+}
+#pi-font-pop input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent, currentColor); }
+#pi-font-pop output { min-width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+#pi-font-pop .pi-foot { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+#pi-font-pop .pi-note { flex: 1; color: var(--dim); font-size: 11px; }
+#pi-font-pop button { padding: 1px 10px; color: var(--text); }
+#pi-font-pop :focus-visible, #pi-bar .pi-fontbtn:focus-visible { outline: 2px solid var(--accent, currentColor); outline-offset: 1px; }

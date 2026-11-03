@@ -63,7 +63,24 @@ CSS/JS を直しても export の再生成は不要で、再ビルド（`include
   ヘッダーの `[data-action=toggle-thinking|toggle-tools]`。
 - フェイルセーフ: 機能ごとに try/catch。セレクタやデータ形状が想定と違えば何もしない（元の表示のまま）。
   配色は export の CSS 変数（`--text` `--dim` `--accent` `--body-bg` …）に追従するため、ダーク/ライトも export のテーマのまま。
-- 見た目の比較画像: `docs/session-before.png`（素の export）/ `docs/session-after.png`（注入後）/ `docs/session-after-mobile.png`（幅 480px）。
+- 見た目の比較画像: `docs/session-before.png`（素の export）/ `docs/session-after.png`（注入後）/ `docs/session-after-mobile.png`（幅 480px）/ `docs/session-font.png`（`Aa` ポップオーバー）。
+
+### 本文フォントの変更（上部バーの「Aa」）
+
+要約バーの `Aa` ボタンでポップオーバーが開き、右側の本文領域（`#content`）の見た目を変えられます（左のツリーは対象外）。
+
+- 本文: フォント（プリセット select ＋ 自由入力 `font-family`。**入力欄があればそちらが優先**）、サイズ 12〜24px、行間 1.3〜2.2。
+- コード・ツール出力: 等幅フォント（select ＋ 自由入力）、サイズ 10〜24px。`リセット` で既定に戻します。
+- 適用は CSS 変数 `--ph-font` `--ph-font-size` `--ph-line` `--ph-mono` `--ph-mono-size`（`inject.css` が参照。未設定なら従来の見た目）。
+  変更は即時反映され、350ms 後に保存します。
+- **保存先**: `<agentDir>/session-history/ui.json`（サーバ側。ポートが毎回変わっても全セッション共通で残ります）。
+  併せて `localStorage`（キー `pi-history.sessionFont.v1`）にも書き、サーバに保存できない場合のフォールバックにします
+  （サーバに `ui.json` がまだ無く localStorage にだけある場合に限り、そのコピーを適用し、次回ページを開いたときサーバへ引き継ぎます。`リセット` は空の `ui.json`（`{}`）を残すので、他オリジンの古い localStorage が復活することはありません）。
+- ちらつき防止: サーバが `ui.json` の内容を `<style id="pi-prefs">:root{--ph-…}</style>` として `</head>` 直前へ埋め込んで返します（設定が無ければ何も足しません）。
+- API: `GET /api/ui-prefs` → `{ok, prefs|null}`。`POST /api/ui-prefs`（本文は JSON オブジェクト、`{"reset":true}` で削除）は
+  Host 検証に加え、`Content-Type: application/json` 必須・`Origin` が自サーバ（`http://127.0.0.1:<port>` / `http://localhost:<port>`）と一致する場合のみ受理（`server.json` のトークンは不要）。本文は最大 8KB。
+- サニタイズ（`src/prefs.rs`）: font-family は 200 文字以内、英数字（日本語可）・空白・`, - _ .`・対になった引用符のみ許可し、`; { } < > ( ) \ / : @ !` などを含む値は捨てます。数値は範囲外なら捨て、刻みに丸めます。
+- 既知の制限: 同じ `ui.json` を複数ブラウザで共有（最後に保存した設定が全部に効く）。開いたままの他タブには再読み込みするまで反映されません。
 
 ## Pi CLI への依存
 

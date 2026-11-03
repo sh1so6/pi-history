@@ -1,7 +1,9 @@
 //! 127.0.0.1 HTTP server: list page, /api/index, /session/<id>, plus token-protected control endpoints.
 use crate::export::{ensure_session_html, Exporter};
+use crate::prefs::Prefs;
 use crate::scan::{build_index, now_iso, scan_sessions, Index, ScanOptions, ScanResult, SessionEntry, SpendRow};
 use serde::Serialize;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -44,6 +46,9 @@ pub struct AppState {
     pub sessions_dir: PathBuf,
     pub cache_path: PathBuf,
     pub html_dir: PathBuf,
+    /// `<agentDir>/session-history/ui.json` and its in-memory copy (served-page font preferences)
+    pub prefs_path: PathBuf,
+    pub prefs: RwLock<Option<Prefs>>,
     pub exporter: Box<Exporter>,
     pub token: String,
     pub port: u16,
@@ -159,6 +164,66 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
     req.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str().to_string())
 }
 
+/// CSRF guard for the prefs POST: the browser sets `Origin` on every cross-origin request and on same-origin POSTs.
+pub fn is_own_origin(origin: Option<&str>, port: u16) -> bool {
+    match origin {
+        None => false,
+        Some(o) => {
+            let o = o.to_ascii_lowercase();
+            o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}")
+        }
+    }
+}
+
+fn is_json_content_type(ct: Option<&str>) -> bool {
+    ct.map(|c| c.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")).unwrap_or(false)
+}
+
+const MAX_PREFS_BODY: u64 = 8 * 1024;
+
+fn json_error(req: Request, status: u16, msg: &str) {
+    send(req, status, JSON, serde_json::json!({"ok": false, "error": msg}).to_string().into_bytes(), &[]);
+}
+
+fn prefs_body(prefs: &Option<Prefs>) -> Vec<u8> {
+    serde_json::json!({"ok": true, "prefs": prefs}).to_string().into_bytes()
+}
+
+/// POST /api/ui-prefs (no server.json token: the page itself calls it). Host is already checked; additionally
+/// the body must be JSON and the Origin must be this server, so other sites / forms cannot write it.
+fn handle_prefs_post(state: &Arc<AppState>, mut req: Request) {
+    if !is_json_content_type(header_value(&req, "Content-Type").as_deref()) {
+        return json_error(req, 415, "Content-Type must be application/json");
+    }
+    if !is_own_origin(header_value(&req, "Origin").as_deref(), state.port) {
+        return json_error(req, 403, "bad origin");
+    }
+    let mut body = Vec::new();
+    if req.as_reader().take(MAX_PREFS_BODY + 1).read_to_end(&mut body).is_err() {
+        return json_error(req, 400, "could not read body");
+    }
+    if body.len() as u64 > MAX_PREFS_BODY {
+        return json_error(req, 413, "body too large");
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return json_error(req, 400, "invalid JSON");
+    };
+    if !v.is_object() {
+        return json_error(req, 400, "expected a JSON object");
+    }
+    // reset keeps an empty ui.json ({}) rather than deleting it: "the server has spoken", so browsers do not
+    // resurrect an older localStorage copy
+    let new = Some(if v.get("reset") == Some(&serde_json::Value::Bool(true)) { Prefs::default() } else { Prefs::from_value(&v) });
+    let mut guard = state.prefs.write().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = crate::prefs::save(&state.prefs_path, &new) {
+        drop(guard);
+        return json_error(req, 500, &format!("could not save: {e}"));
+    }
+    *guard = new.clone();
+    drop(guard);
+    send(req, 200, JSON, prefs_body(&new), &[]);
+}
+
 fn query_flag(query: &str, key: &str) -> bool {
     query.split('&').any(|kv| {
         let mut it = kv.splitn(2, '=');
@@ -181,11 +246,18 @@ pub fn handle(state: &Arc<AppState>, req: Request) {
     if method == Method::Post && (path == "/api/rescan" || path == "/api/shutdown") {
         return handle_control(state, req, &path, &query);
     }
+    if method == Method::Post && path == "/api/ui-prefs" {
+        return handle_prefs_post(state, req);
+    }
     if method != Method::Get && method != Method::Head {
         return send_html(req, 405, "method not allowed", &[("Allow", "GET, HEAD")]);
     }
     if path == "/" {
         return send(req, 200, HTML, INDEX_HTML.as_bytes().to_vec(), &[]);
+    }
+    if path == "/api/ui-prefs" {
+        let p = state.prefs.read().unwrap_or_else(|e| e.into_inner()).clone();
+        return send(req, 200, JSON, prefs_body(&p), &[]);
     }
     if path == "/api/index" {
         let snap = state.snapshot();
@@ -200,7 +272,10 @@ pub fn handle(state: &Arc<AppState>, req: Request) {
             // decorate at serve time (the cached export file stays untouched); PI_SESSION_HISTORY_NO_INJECT=1 serves it as is
             Ok(out) if !crate::inject::disabled() => match std::fs::read(&out) {
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(html) => send(req, 200, HTML, crate::inject::inject(&html).into_bytes(), &[]),
+                    Ok(html) => {
+                        let prefs = state.prefs.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        send(req, 200, HTML, crate::inject::inject_with(&html, prefs.as_ref()).into_bytes(), &[])
+                    }
                     Err(e) => send(req, 200, HTML, e.into_bytes(), &[]),
                 },
                 Err(e) => send_html(req, 500, &format!("HTML export failed\n{e}"), &[]),
@@ -294,13 +369,17 @@ mod tests {
     }
 
     fn request(port: u16, method: &str, path: &str, host: Option<&str>, extra: &[(&str, &str)]) -> (u16, String, String) {
+        request_body(port, method, path, host, extra, "")
+    }
+
+    fn request_body(port: u16, method: &str, path: &str, host: Option<&str>, extra: &[(&str, &str)], body: &str) -> (u16, String, String) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let host = host.map(str::to_string).unwrap_or(format!("127.0.0.1:{port}"));
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
         for (k, v) in extra {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
-        req.push_str("\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         s.write_all(req.as_bytes()).unwrap();
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).unwrap();
@@ -330,6 +409,8 @@ mod tests {
             sessions_dir: sessions.clone(),
             cache_path: dir.join("cache.json"),
             html_dir: dir.join("html"),
+            prefs_path: dir.join("ui.json"),
+            prefs: RwLock::new(None),
             exporter: Box::new(move |_s, out| {
                 if fail2.load(Ordering::SeqCst) {
                     return Err("boom <bad>".into());
@@ -368,6 +449,38 @@ mod tests {
         assert!(b.starts_with(crate::inject::MARKER) && b.contains("<html>session</html>") && b.ends_with("</script>\n"));
         let cached = std::fs::read_to_string(state.html_dir.join(format!("{}.html", state.snapshot().index.entries[0].id))).unwrap();
         assert_eq!(cached, "<html>session</html>");
+        // font prefs: GET is open (Host-checked), POST needs JSON + own Origin, persists to ui.json, shows up in served pages
+        let (c, _, b) = request(port, "GET", "/api/ui-prefs", None, &[]);
+        assert!(c == 200 && b.contains("\"prefs\":null"), "{b}");
+        let own = format!("http://127.0.0.1:{port}");
+        let json_ct = ("Content-Type", "application/json");
+        let good = r#"{"font":"Foo Bar","size":17,"line":9,"mono":"a;b"}"#;
+        assert_eq!(request(port, "GET", "/api/ui-prefs", Some("evil.example"), &[]).0, 403);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", Some("evil.example"), &[json_ct, ("Origin", &own)], good).0, 403);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[("Origin", &own)], good).0, 415);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[("Content-Type", "text/plain"), ("Origin", &own)], good).0, 415);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct], good).0, 403);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", "http://evil.example")], good).0, 403);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", &format!("http://127.0.0.1:{}", port + 1))], good).0, 403);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", &own)], "nope").0, 400);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", &own)], "[1]").0, 400);
+        assert_eq!(request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", &own)], &"x".repeat(9000)).0, 413);
+        assert!(state.prefs.read().unwrap().is_none() && !state.prefs_path.exists());
+        let (c, _, b) = request_body(port, "POST", "/api/ui-prefs", None, &[("Content-Type", "application/json; charset=utf-8"), ("Origin", &own)], good);
+        assert_eq!(c, 200, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["prefs"], serde_json::json!({"font": "Foo Bar", "size": 17.0}));
+        assert!(state.prefs_path.exists());
+        assert_eq!(crate::prefs::load(&state.prefs_path), state.prefs.read().unwrap().clone());
+        let (_, _, b) = request(port, "GET", "/session/s1", None, &[]);
+        assert!(b.contains(":root{--ph-font:Foo Bar,var(--pi-sans);--ph-font-size:17px}"), "{b}");
+        let (_, _, b) = request(port, "GET", "/api/ui-prefs", None, &[]);
+        assert!(b.contains("\"font\":\"Foo Bar\""));
+        let (c, _, _) = request_body(port, "POST", "/api/ui-prefs", None, &[json_ct, ("Origin", &format!("http://localhost:{port}"))], r#"{"reset":true}"#);
+        assert!(c == 200 && state.prefs_path.exists() && *state.prefs.read().unwrap() == Some(Prefs::default()));
+        assert_eq!(crate::prefs::load(&state.prefs_path), Some(Prefs::default()));
+        let b = request(port, "GET", "/session/s1", None, &[]).2;
+        assert!(!b.contains("<style id=\"pi-prefs\"") && b.contains("id=\"pi-prefs-json\" data-pi-history>{}</script>"));
         assert_eq!(request(port, "GET", "/session/nope", None, &[]).0, 404);
         assert_eq!(request(port, "GET", "/session/..%2F..%2Fwindows%2Fwin.ini", None, &[]).0, 404);
         assert_eq!(request(port, "GET", &format!("/session/{}", crate::scan::encode_uri_component(&state.snapshot().index.entries[0].file)), None, &[]).0, 404);

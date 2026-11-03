@@ -4,6 +4,7 @@
 
 const CSS: &str = include_str!("inject.css");
 const JS: &str = include_str!("inject.js");
+const HEAD_JS: &str = include_str!("inject_head.js");
 
 /// Present in everything we inject; used to avoid double injection.
 pub const MARKER: &str = "<!--pi-history-inject-->";
@@ -14,11 +15,28 @@ pub fn disabled() -> bool {
 
 /// Insert the style before the first `</head>` (else at the very start) and the script before the
 /// last `</body>` (else at the very end). Already-injected input is returned unchanged.
+#[allow(dead_code)]
 pub fn inject(html: &str) -> String {
+    inject_with(html, None)
+}
+
+/// Like [`inject`], plus the saved font preferences: a `<style id="pi-prefs">` (applied before first paint, no
+/// flicker), the same values as JSON for the Aa popover, and the head helper script.
+pub fn inject_with(html: &str, prefs: Option<&crate::prefs::Prefs>) -> String {
     if html.contains(MARKER) {
         return html.to_string();
     }
-    let style = format!("{MARKER}<style data-pi-history>\n{CSS}\n</style>\n");
+    let mut style = format!("{MARKER}<style data-pi-history>\n{CSS}\n</style>\n");
+    if let Some(p) = prefs {
+        if let Some(css) = p.css() {
+            style.push_str(&format!("<style id=\"pi-prefs\" data-pi-history>{css}</style>\n"));
+        }
+        // present even when empty ("reset"): tells the page the server is authoritative, so no localStorage fallback.
+        // values are allowlisted already (no `<`); the replace is belt and braces
+        let json = serde_json::to_string(p).unwrap_or_else(|_| "{}".into()).replace('<', "\\u003c");
+        style.push_str(&format!("<script type=\"application/json\" id=\"pi-prefs-json\" data-pi-history>{json}</script>\n"));
+    }
+    style.push_str(&format!("<script data-pi-head>\n{HEAD_JS}\n</script>\n"));
     let script = format!("<script data-pi-history>\n{JS}\n</script>\n");
     let head_at = html.find("</head>").unwrap_or(0);
     let mut out = String::with_capacity(html.len() + style.len() + script.len());
@@ -85,5 +103,25 @@ mod tests {
         assert!(!CSS.to_ascii_lowercase().contains("</style"));
         assert!(!JS.to_ascii_lowercase().contains("</script"));
         assert!(!JS.contains("<!--"));
+        assert!(!HEAD_JS.to_ascii_lowercase().contains("</script") && !HEAD_JS.contains("<!--"));
+    }
+
+    #[test]
+    fn prefs_are_embedded_in_head_only_when_set() {
+        let html = "<html><head></head><body></body></html>";
+        let plain = inject_with(html, None);
+        assert!(!plain.contains("<style id=\"pi-prefs\""));
+        let p = crate::prefs::Prefs::from_value(&serde_json::json!({"font": "Foo Bar", "size": 17, "mono": "x</style><script>alert(1)</script>"}));
+        let out = inject_with(html, Some(&p));
+        let at = out.find("<style id=\"pi-prefs\"").unwrap();
+        assert!(out.contains(":root{--ph-font:Foo Bar,var(--pi-sans);--ph-font-size:17px}</style>"));
+        assert!(at < out.find("</head>").unwrap() && out.find("</head>").unwrap() < out.find("<script data-pi-history>
+/* pi-history: injected").unwrap());
+        assert!(!out.contains("alert(1)"));
+        assert_eq!(out.matches("<script").count(), 3);
+        // server-side reset (empty prefs): no style, but the (empty) JSON marker so the page skips its localStorage fallback
+        let empty = inject_with(html, Some(&crate::prefs::Prefs::default()));
+        assert!(!empty.contains("<style id=\"pi-prefs\"") && empty.contains("id=\"pi-prefs-json\" data-pi-history>{}</script>"));
+        assert!(!plain.contains("id=\"pi-prefs-json\""));
     }
 }
