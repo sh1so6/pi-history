@@ -88,6 +88,21 @@ table.sp .tg[aria-expanded=true]{transform:rotate(90deg)}
 .spchart .bs{fill:var(--ac2);pointer-events:none}
 .spaxis{display:flex;justify-content:space-between;color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
 .spaxis .mx{order:-1}
+.cachep{--cdrop:#e0556b;--crc:#3b82f6;--cttl:#d97706;--cmod:#8b5cf6;--coth:#8a93a3}
+.cachep .cchart{margin-top:4px}
+.cachep h4{margin:0;font-size:13px;font-weight:600}
+.cachep .cleg{display:flex;flex-wrap:wrap;gap:2px 12px;color:var(--mut);font-size:12px;margin:2px 0}
+.cachep .cleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.cachep svg{display:block;width:100%;height:90px;background:color-mix(in srgb,var(--ac) 4%,transparent);border-radius:4px}
+.cachep svg .hit{fill:transparent}
+.cachep svg .hit:hover{fill:color-mix(in srgb,var(--ac) 14%,transparent)}
+.cachep svg rect:not(.hit){pointer-events:none}
+.cachep .k-drop{fill:var(--cdrop)}.cachep .k-rc{fill:var(--crc)}.cachep .k-ttl{fill:var(--cttl)}.cachep .k-mod{fill:var(--cmod)}.cachep .k-oth{fill:var(--coth)}
+.cachep .cleg .k-drop{background:var(--cdrop)}.cachep .cleg .k-rc{background:var(--crc)}.cachep .cleg .k-ttl{background:var(--cttl)}.cachep .cleg .k-mod{background:var(--cmod)}.cachep .cleg .k-oth{background:var(--coth)}
+.cachep .sptot .sub{color:var(--mut);font-size:12px}
+.cachep .badge{font-size:11px;border:1px solid var(--bd);border-radius:999px;padding:0 6px;margin-left:4px;color:var(--mut)}
+.cachep .bar i{background:var(--crc)}
+.cachep .cmore{display:block;margin:8px auto 0}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:6px 14px;border-radius:6px;opacity:0;pointer-events:none;transition:opacity .15s}
 #toast.show{opacity:.92}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
@@ -108,6 +123,7 @@ table.sp .tg[aria-expanded=true]{transform:rotate(90deg)}
 </div>
 <div class="controls"><span id="range" class="chip" hidden><span id="rangeText"></span></span><span id="projChip" class="chip" hidden><span id="projChipText"></span><button type="button" id="projChipClear" aria-label="プロジェクト絞り込みを解除">×</button></span></div>
 <details id="spend" class="spend panel" open><summary>期間の支出<span id="spendScope" class="sc"></span></summary><div id="spendBody"></div></details>
+<details id="cachep" class="spend cachep panel" open><summary>キャッシュ（miss / relay）<span id="cachepScope" class="sc"></span></summary><div id="cachepBody"></div></details>
 <p id="summary" aria-live="polite">読み込み中…</p>
 <div id="list"></div>
 </main>
@@ -206,11 +222,57 @@ function spendDays(agg,sel){
   else if(keys.length){lo=keys[0];hi=keys[keys.length-1]}
   return dateKeysBetween(lo,hi).map(function(k){var d=agg.days[k];return {date:k,cost:d?d.cost:0,subCost:d?d.subCost:0}});
 }
+function cacheZero(){return {misses:0,missTokens:0,missCost:0,missTtl:0,missTtlTokens:0,missModel:0,missModelTokens:0,
+  relays:0,relayBefore:0,relayAfter:0,relayDropped:0,relayRecache:0,relayRecacheCost:0,
+  compacts:0,compactBefore:0,compactAfter:0,compactDropped:0,compactRecache:0,compactRecacheCost:0}}
+var CACHE_KEYS=Object.keys(cacheZero());
+// Pure: rows = /api/index `cache` (may be undefined), sel/projOk as aggregateSpend. Search text never applies.
+// Returns totals and per-day sums (days[date] has the totals shape).
+function aggregateCache(rows,sel,projOk){
+  var total=cacheZero(),days={};
+  for(var i=0;i<(rows||[]).length;i++){
+    var r=rows[i];
+    if(sel&&!inRange(r.date,sel.start,sel.end))continue;
+    if(projOk&&!projOk(r.project))continue;
+    var d=r.date?(days[r.date]||(days[r.date]=cacheZero())):null;
+    for(var k=0;k<CACHE_KEYS.length;k++){var key=CACHE_KEYS[k],v=Number(r[key])||0;total[key]+=v;if(d)d[key]+=v}
+  }
+  return {total:total,days:days};
+}
+// Pure: chart data for each day of the range (selection, else first..last day with data); same range logic as spendDays.
+function cacheDays(agg,sel){
+  var keys=Object.keys(agg.days).sort(),lo,hi;
+  if(sel){lo=sel.start;hi=sel.end||sel.start;if(lo>hi){var t=lo;lo=hi;hi=t}}
+  else if(keys.length){lo=keys[0];hi=keys[keys.length-1]}
+  return dateKeysBetween(lo,hi).map(function(k){
+    var d=agg.days[k]||cacheZero();
+    var ttl=d.missTtlTokens,mod=d.missModelTokens,oth=Math.max(0,d.missTokens-ttl-mod);
+    return {date:k,dropped:d.relayDropped+d.compactDropped,recache:d.relayRecache+d.compactRecache,
+      recacheCost:d.relayRecacheCost+d.compactRecacheCost,events:d.relays+d.compacts,
+      misses:d.misses,missTokens:d.missTokens,missCost:d.missCost,missTtl:ttl,missModel:mod,missOther:oth};
+  });
+}
+// Pure: events newest first, filtered by inRange(date) and projOk (never by search text).
+function filterCacheEvents(events,sel,projOk){
+  var out=(events||[]).filter(function(e){
+    if(sel&&!inRange(e.date,sel.start,sel.end))return false;
+    if(projOk&&!projOk(e.project))return false;
+    return true;
+  });
+  out.sort(function(a,b){return a.ts<b.ts?1:a.ts>b.ts?-1:0});
+  return out;
+}
+// Pure: relay events by trigger (manual/input/expiry/unknown).
+function cacheTriggerCounts(events){
+  var c={manual:0,input:0,expiry:0,unknown:0};
+  (events||[]).forEach(function(e){if(e.kind!=="relay")return;if(e.trigger==="manual"||e.trigger==="input"||e.trigger==="expiry")c[e.trigger]++;else c.unknown++});
+  return c;
+}
 function resumeCommand(file){return "pi --session "+(/\s/.test(file)?"\""+file+"\"":file)}
 
 (function(){
 var MAX=1000;
-var state={entries:[],spend:[],expanded:{},project:"",projSub:"",q:"",sort:"new",sel:null,limit:MAX,month:null,focusKey:""};
+var state={entries:[],spend:[],cache:[],cacheEvents:[],cacheLimit:50,cacheKey:"",expanded:{},project:"",projSub:"",q:"",sort:"new",sel:null,limit:MAX,month:null,focusKey:""};
 var $=function(id){return document.getElementById(id)};
 var ESC={"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"};
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return ESC[c]})}
@@ -354,11 +416,94 @@ function renderSpend(){
   h+="<p class=\"spnote\">日付はメッセージのローカル日。範囲はカレンダー選択（未選択は全期間）とプロジェクト絞り込みに従い、検索語は適用しません。サブエージェントの支出は起動元セッションのプロジェクトに合算。</p>";
   $("spendBody").innerHTML=h;
 }
+var CACHE_LIMIT=50;
+var TRIG={manual:"手動",input:"入力時",expiry:"期限前"};
+function cacheChart(days,max,label,series,tip){
+  if(!days.length)return "";
+  var W=Math.max(days.length,14),h="<svg viewBox=\"0 0 "+W+" 100\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\""+esc(label)+"\">";
+  days.forEach(function(d,i){
+    h+="<g><title>"+esc(tip(d))+"</title><rect class=\"hit\" x=\""+i+"\" y=\"0\" width=\"1\" height=\"100\"/>";
+    var y=100;
+    series.forEach(function(s,j){
+      var bh=max?d[s.key]/max*98:0;
+      if(bh<=0)return;
+      if(s.grouped)h+="<rect class=\""+s.cls+"\" x=\""+(i+0.1+j*0.4).toFixed(2)+"\" y=\""+(100-bh).toFixed(2)+"\" width=\"0.38\" height=\""+bh.toFixed(2)+"\"/>";
+      else{y-=bh;h+="<rect class=\""+s.cls+"\" x=\""+(i+0.12).toFixed(2)+"\" y=\""+y.toFixed(2)+"\" width=\"0.76\" height=\""+bh.toFixed(2)+"\"/>"}
+    });
+    h+="</g>";
+  });
+  return h+"</svg>";
+}
+function cacheChartBlock(days,title,series,maxOf,tip,legend){
+  var max=days.reduce(function(a,d){var v=maxOf(d);return v>a?v:a},0);
+  return "<div class=\"cchart\"><h4>"+esc(title)+"</h4><div class=\"cleg\">"+legend+"</div>"
+    +cacheChart(days,max,title,series,tip)
+    +"<div class=\"spaxis\"><span>"+esc(days.length?days[0].date:"")+"</span><span>最大 "+fmtTok(max)+" tokens/日</span><span>"+esc(days.length?days[days.length-1].date:"")+"</span></div></div>";
+}
+function cacheEventRow(e){
+  var ms=Date.parse(e.ts),ratio=e.before>0?Math.min(100,Math.max(0,e.after/e.before*100)):0;
+  var trig=e.trigger&&TRIG[e.trigger]?"（"+TRIG[e.trigger]+"）":"";
+  return "<tr><td class=\"l\">"+esc(isNaN(ms)?e.ts:fmtTime(ms))+"</td><td class=\"l\">"+esc(e.project)+(e.sub?"<span class=\"badge\">サブ</span>":"")+"</td>"
+    +"<td class=\"l\">"+esc(e.kind+trig)+"</td>"
+    +"<td title=\""+e.before+" → "+e.after+"\">"+fmtTok(e.before)+" → "+fmtTok(e.after)+" <span class=\"bar\" title=\"after/before "+ratio.toFixed(0)+"%\"><i style=\"width:"+ratio.toFixed(1)+"%\"></i></span></td>"
+    +"<td title=\""+e.dropped+"\">"+fmtTok(e.dropped)+"</td><td title=\""+e.recache+"\">"+fmtTok(e.recache)+"</td><td>"+fmtMoney(e.recacheCost)+"</td></tr>";
+}
+function cacheCard(big,unit,extra){
+  return "<div class=\"sptot\"><span class=\"big\">"+big+"<span class=\"k\">"+unit+"</span></span>"+extra+"</div>";
+}
+function cacheKv(k,v,title){return "<span><span class=\"k\">"+k+"</span>"+(title!=null?"<span title=\""+title+"\">"+v+"</span>":v)+"</span>"}
+function renderCache(){
+  var sel=state.sel,agg=aggregateCache(state.cache,sel,spendProjOk),t=agg.total;
+  var evs=filterCacheEvents(state.cacheEvents,sel,spendProjOk);
+  var scope=(sel?rangeLabel(sel):"全期間")+(state.project?" / "+state.project:state.projSub?" / "+state.projSub:"");
+  $("cachepScope").textContent=scope+" — relay "+t.relays+" / compact "+t.compacts+" / miss "+t.misses;
+  if(!$("cachep").open)return;
+  var body=$("cachepBody");
+  if(!state.cache.length&&!state.cacheEvents.length){body.innerHTML="<p class=\"empty\">キャッシュ統計がありません（pi-history を更新して再起動してください）</p>";return}
+  var key=scope+"|"+state.cacheEvents.length;
+  if(state.cacheKey!==key){state.cacheKey=key;state.cacheLimit=CACHE_LIMIT}
+  var trigTxt="";
+  if(state.cacheEvents.length){
+    var tc=cacheTriggerCounts(evs),parts=[];
+    ["manual","input","expiry"].forEach(function(k){parts.push(TRIG[k]+" "+tc[k])});
+    if(tc.unknown)parts.push("不明 "+tc.unknown);
+    trigTxt="<span class=\"sub\">"+esc(parts.join(" / "))+"</span>";
+  }
+  var oth=Math.max(0,t.misses-t.missTtl-t.missModel),othTok=Math.max(0,t.missTokens-t.missTtlTokens-t.missModelTokens);
+  var h=cacheCard(t.relays,"回 relay",trigTxt+cacheKv("ドロップ合計",fmtTok(t.relayDropped),t.relayDropped)+cacheKv("再キャッシュ書込",fmtTok(t.relayRecache)+" / "+fmtMoney(t.relayRecacheCost),t.relayRecache))
+    +cacheCard(t.compacts,"回 compaction",cacheKv("ドロップ合計",fmtTok(t.compactDropped),t.compactDropped)+cacheKv("再キャッシュ書込",fmtTok(t.compactRecache)+" / "+fmtMoney(t.compactRecacheCost),t.compactRecache))
+    +cacheCard(t.misses,"件 cache miss",cacheKv("再処理",fmtTok(t.missTokens),t.missTokens)+cacheKv("推定コスト",fmtMoney(t.missCost))
+      +cacheKv("TTL切れ",t.missTtl+"件 / "+fmtTok(t.missTtlTokens))+cacheKv("モデル切替",t.missModel+"件 / "+fmtTok(t.missModelTokens))+cacheKv("その他",oth+"件 / "+fmtTok(othTok)));
+  var days=cacheDays(agg,sel);
+  if(days.length){
+    var a=cacheChartBlock(days,"日別「ドロップ vs 再キャッシュ」",[{key:"dropped",cls:"k-drop",grouped:true},{key:"recache",cls:"k-rc",grouped:true}],
+      function(d){return Math.max(d.dropped,d.recache)},
+      function(d){return d.date+"  ドロップ "+fmtTok(d.dropped)+" / 再キャッシュ "+fmtTok(d.recache)+"（"+fmtMoney(d.recacheCost)+"）"+(d.events?"  "+d.events+"件":"")},
+      "<span><i class=\"k-drop\"></i>ドロップ（relay+compaction）</span><span><i class=\"k-rc\"></i>再キャッシュ書込</span>");
+    var b=cacheChartBlock(days,"日別「cache miss の再処理 tokens」",[{key:"missTtl",cls:"k-ttl"},{key:"missModel",cls:"k-mod"},{key:"missOther",cls:"k-oth"}],
+      function(d){return d.missTokens},
+      function(d){return d.date+"  miss "+d.misses+"件 / "+fmtTok(d.missTokens)+"（TTL "+fmtTok(d.missTtl)+" / モデル "+fmtTok(d.missModel)+" / その他 "+fmtTok(d.missOther)+"）  "+fmtMoney(d.missCost)},
+      "<span><i class=\"k-ttl\"></i>TTL切れ</span><span><i class=\"k-mod\"></i>モデル切替</span><span><i class=\"k-oth\"></i>その他</span>");
+    h+="<div class=\"spgrid\">"+a+b+"</div>";
+  }
+  if(!evs.length){
+    h+="<p class=\"empty\">この条件の relay / compaction はありません。</p>";
+  }else{
+    var shown=Math.min(evs.length,state.cacheLimit);
+    h+="<div class=\"sptbl\"><table class=\"sp\"><thead><tr><th class=\"l\">日時</th><th class=\"l\">プロジェクト</th><th class=\"l\">種別</th><th>before → after</th><th>ドロップ</th><th>再キャッシュ tokens</th><th>再キャッシュ $</th></tr></thead><tbody>";
+    for(var i=0;i<shown;i++)h+=cacheEventRow(evs[i]);
+    h+="</tbody></table></div>";
+    if(evs.length>shown)h+="<button type=\"button\" id=\"cacheMore\" class=\"more cmore\">さらに表示（残り "+(evs.length-shown)+"件）</button>";
+  }
+  h+="<p class=\"spnote\">cache miss = 直前の接頭辞の50%未満しか cacheRead できなかった要求（再処理 tokens と推定コストは書き直し分）。relay / compaction 後の最初の要求は miss に数えず、再キャッシュとして集計します。before は tokensBefore の推定値、ドロップ = Σ max(0, before − after)。範囲はカレンダー選択とプロジェクト絞り込みに従い、検索語は適用しません。</p>";
+  body.innerHTML=h;
+}
 function refresh(){
   var r=compute();
   renderCalendar(r.counts);
   renderList(r.list);
   renderSpend();
+  renderCache();
 }
 function setMonthFromKey(key){var p=key.split("-");state.month={y:+p[0],m:+p[1]-1}}
 function shiftMonth(n){var d=new Date(state.month.y,state.month.m+n,1);state.month={y:d.getFullYear(),m:d.getMonth()};refresh()}
@@ -366,6 +511,8 @@ function keyAdd(key,n){var p=key.split("-");return dateKey(new Date(+p[0],+p[1]-
 function init(data){
   state.entries=prepare(data.entries||[]);
   state.spend=data.spend||[];
+  state.cache=data.cache||[];
+  state.cacheEvents=data.cacheEvents||[];
   var q=new URLSearchParams(location.search);
   state.projSub=q.get("project")||"";
   buildProjects();
@@ -396,6 +543,8 @@ $("cal").addEventListener("keydown",function(ev){
   setMonthFromKey(nk);state.focusKey=nk;refresh();
 });
 $("spend").addEventListener("toggle",function(){renderSpend()});
+$("cachep").addEventListener("toggle",function(){renderCache()});
+$("cachepBody").addEventListener("click",function(ev){if(ev.target.closest("#cacheMore")){state.cacheLimit+=CACHE_LIMIT;renderCache()}});
 $("spendBody").addEventListener("click",function(ev){
   var tg=ev.target.closest("[data-tg]");
   if(tg){var k=tg.getAttribute("data-tg");state.expanded[k]=!state.expanded[k];renderSpend();return}
