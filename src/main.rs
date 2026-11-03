@@ -216,6 +216,26 @@ fn run_daemon_child(agent: &Path, include: bool) -> i32 {
     }
 }
 
+/// Windows: CreateProcess(bInheritHandles=TRUE) would hand our own std handles to the detached server, so a caller
+/// capturing our output through a pipe would never see EOF. Make them non-inheritable first (the child gets its own pipes).
+#[cfg(windows)]
+fn uninherit_std_handles() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(n: u32) -> isize;
+        fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
+    }
+    for n in [-10i32, -11, -12] {
+        // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE; HANDLE_FLAG_INHERIT = 1
+        unsafe {
+            let h = GetStdHandle(n as u32);
+            if h != 0 && h != -1 {
+                SetHandleInformation(h, 1, 0);
+            }
+        }
+    }
+}
+
 fn spawn_daemon(include: bool) -> Result<(u16, [u64; 4]), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let build = |breakaway: bool| {
@@ -241,6 +261,8 @@ fn spawn_daemon(include: bool) -> Result<(u16, [u64; 4]), String> {
         let _ = breakaway;
         cmd
     };
+    #[cfg(windows)]
+    uninherit_std_handles();
     let mut child = match build(true).spawn() {
         Ok(c) => c,
         Err(_) => build(false).spawn().map_err(|e| format!("could not start background server: {e}"))?,
