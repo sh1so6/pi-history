@@ -283,7 +283,7 @@ fn day(n: u64) -> CacheDay {
 }
 
 fn event(kind: &str, ts: &str, before: u64) -> CacheEventRow {
-    CacheEventRow { ts: ts.into(), date: "2026-10-01".into(), kind: kind.into(), before, after: 40, dropped: before - 40, recache: 30, recache_cost: 0.25 }
+    CacheEventRow { ts: ts.into(), date: "2026-10-01".into(), kind: kind.into(), before, after: 40, dropped: before - 40, recache: 30, recache_cost: 0.25, ..Default::default() }
 }
 
 #[test]
@@ -312,15 +312,16 @@ fn cache_folds_subagents_into_owner_project() {
     // JSON contract
     let v = serde_json::to_value(&rows[0]).unwrap();
     for k in ["date", "project", "sub", "misses", "missTokens", "missCost", "missTtl", "missTtlTokens", "missModel", "missModelTokens", "relays", "relayBefore", "relayAfter",
-        "relayDropped", "relayRecache", "relayRecacheCost", "compacts", "compactBefore", "compactAfter", "compactDropped", "compactRecache", "compactRecacheCost"] {
+        "relayDropped", "relayRecache", "relayRecacheCost", "compacts", "compactBefore", "compactAfter", "compactDropped", "compactRecache", "compactRecacheCost",
+        "relayPostRequests", "relaySavings", "compactPostRequests", "compactSavings"] {
         assert!(v.get(k).is_some(), "{k}");
     }
-    assert_eq!(v.as_object().unwrap().len(), 22);
+    assert_eq!(v.as_object().unwrap().len(), 26);
     let v = serde_json::to_value(&events[0]).unwrap();
-    for k in ["ts", "date", "project", "sub", "kind", "before", "after", "dropped", "recache", "recacheCost", "sid", "trigger"] {
+    for k in ["ts", "date", "project", "sub", "kind", "before", "after", "dropped", "recache", "recacheCost", "postRequests", "savings", "net", "breakEven", "open", "sid", "trigger"] {
         assert!(v.get(k).is_some(), "{k}");
     }
-    assert_eq!(v.as_object().unwrap().len(), 12);
+    assert_eq!(v.as_object().unwrap().len(), 17);
     assert!(v["trigger"].is_null());
 }
 
@@ -396,7 +397,7 @@ fn miss_rows_roundtrip_through_cache_file() {
     assert_eq!((r2.parsed, r2.cached), (0, 1));
     assert_eq!(r2.cache, r1.cache);
     let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-    assert_eq!(raw["version"], 3);
+    assert_eq!(raw["version"], 4);
     assert_eq!(raw["files"].as_object().unwrap().values().next().unwrap()["cacheDaily"][0]["missTtl"], 1);
     // a v2 cache is dropped and re-parsed
     let mut v = raw;
@@ -405,4 +406,133 @@ fn miss_rows_roundtrip_through_cache_file() {
     let r3 = scan_sessions(&opts);
     assert_eq!((r3.parsed, r3.cache), (1, r1.cache));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/* ------------------------------------------------------------------ break-even */
+
+/// Assistant line with explicit `usage` (input, cacheRead, cacheWrite) and cost (cacheRead, cacheWrite); `cost_cr` None = field missing.
+fn req(id: &str, parent: Option<&str>, start: f64, usage: (u64, u64, u64), cost_cr: Option<f64>, cost_cw: f64, stop: &str) -> String {
+    let mut cost = serde_json::json!({"cacheWrite": cost_cw, "total": cost_cw});
+    if let Some(c) = cost_cr {
+        cost["cacheRead"] = c.into();
+    }
+    let msg = serde_json::json!({"role":"assistant","provider":"anthropic","model":"opus","api":API_ANTHROPIC,"stopReason":stop,"timestamp":T0 + start,
+        "content":[],"usage":{"input":usage.0,"output":5,"cacheRead":usage.1,"cacheWrite":usage.2,"cost":cost}});
+    format!(r#"{{"type":"message","id":"{id}","parentId":{},"timestamp":"{}","message":{msg}}}"#, parent_json(parent), iso_from_ms(T0 + start + 1000.0))
+}
+
+/// Cache-read request worth 30_000 tokens / $0.009.
+fn rd(id: &str, parent: &str, start: f64) -> String {
+    req(id, Some(parent), start, (10, 30_000, 0), Some(0.009), 0.0, "stop")
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+/// `build_cache` over one session file's events.
+fn cache_of(sp: SessionSpend) -> (Vec<CacheRow>, Vec<CacheEvent>) {
+    let s = Scanned { entry: SessionEntry { id: "s1".into(), file: "C:/s/a.jsonl".into(), folder: "f".into(), project: "W/a".into(), ..Default::default() }, spend: sp };
+    build_cache(&[s], &[])
+}
+
+#[test]
+fn break_even_of_a_relay() {
+    let sp = parse(vec![
+        a("a1", None, 0.0, 0, 40_000),
+        comp("c1", Some("a1"), 1_000.0, 100_000, true, 0),
+        // first request after the relay: after = 30_000, recache 30_000 tokens = $0.15, reads nothing
+        req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r2", "r1", 3_000.0),
+        // invalid requests are not counted
+        req("bad", Some("r2"), 3_500.0, (10, 30_000, 0), Some(9.0), 0.0, "error"),
+        rd("r3", "bad", 4_000.0),
+        rd("r4", "r3", 5_000.0),
+    ]);
+    let e = &sp.cache_events[0];
+    assert_eq!((e.post_requests, e.post_cache_read, e.dropped), (4, 90_000, 70_000));
+    let (rows, ev) = cache_of(sp);
+    let e = &ev[0];
+    // rate = 0.027 / 90_000 = 3e-7 $/token; savings = 4 * 70_000 * 3e-7
+    assert_eq!(e.post_requests, 4);
+    assert!(close(e.savings, 0.084), "{}", e.savings);
+    assert!(close(e.net, 0.084 - 0.15), "{}", e.net);
+    assert!(close(e.break_even.unwrap(), 0.15 / (70_000.0 * 3e-7)), "{:?}", e.break_even);
+    assert!(e.open);
+    // daily rows carry the relay sums only
+    let r = &rows[0];
+    assert_eq!((r.relays, r.relay_post_requests, r.compacts, r.compact_post_requests, r.compact_savings), (1, 4, 0, 0, 0.0));
+    assert!(close(r.relay_savings, 0.084));
+    let v = serde_json::to_value(&ev[0]).unwrap();
+    assert_eq!((v["postRequests"].clone(), v["open"].clone()), (4.into(), true.into()));
+    assert!(v["breakEven"].is_f64() && v["savings"].is_f64() && v["net"].is_f64());
+}
+
+#[test]
+fn epochs_end_at_the_next_compaction_and_only_the_last_is_open() {
+    let sp = parse(vec![
+        comp("c1", None, 1_000.0, 100_000, true, 0),
+        req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r2", "r1", 3_000.0),
+        comp("c2", Some("r2"), 4_000.0, 90_000, false, 0),
+        req("r3", Some("c2"), 5_000.0, (0, 0, 20_000), Some(0.0), 0.1, "stop"),
+        rd("r4", "r3", 6_000.0),
+        rd("r5", "r4", 7_000.0),
+    ]);
+    let (rows, ev) = cache_of(sp);
+    assert_eq!(ev.len(), 2);
+    assert_eq!((ev[0].kind.as_str(), ev[0].post_requests, ev[0].open), ("relay", 2, false));
+    assert_eq!((ev[1].kind.as_str(), ev[1].post_requests, ev[1].open), ("compact", 3, true));
+    // compact: rate 3e-7, dropped 70_000, savings = 3 * 70_000 * 3e-7 = 0.063 ... r3 reads 0 -> rate = 0.018 / 60_000
+    assert!(close(ev[1].savings, 3.0 * 70_000.0 * 3e-7), "{}", ev[1].savings);
+    assert!(close(ev[0].savings, 2.0 * 70_000.0 * 3e-7), "{}", ev[0].savings);
+    let sum = |f: fn(&CacheRow) -> f64| rows.iter().map(f).sum::<f64>();
+    assert!(close(sum(|r| r.relay_savings), ev[0].savings) && close(sum(|r| r.compact_savings), ev[1].savings));
+    assert_eq!(rows.iter().map(|r| (r.relay_post_requests, r.compact_post_requests)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)), (2, 3));
+}
+
+#[test]
+fn branches_count_on_their_own_ancestor_chain() {
+    let sp = parse(vec![
+        comp("c1", None, 1_000.0, 100_000, true, 0),
+        req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r2", "r1", 3_000.0),
+        // compaction on the r2 branch ...
+        comp("c2", Some("r2"), 4_000.0, 90_000, false, 0),
+        rd("r3", "c2", 5_000.0),
+        // ... a sibling branch from r1 still belongs to the first epoch, including its descendants
+        rd("b2", "r1", 6_000.0),
+        rd("b3", "b2", 7_000.0),
+    ]);
+    let ev = &sp.cache_events;
+    assert_eq!((ev[0].post_requests, ev[1].post_requests), (4, 1));
+    assert_eq!(ev[0].post_cache_read, 90_000);
+}
+
+#[test]
+fn break_even_unknown_without_dropped_or_read_cost() {
+    // dropped == 0 (the context did not shrink)
+    let sp = parse(vec![
+        comp("c1", None, 1_000.0, 1_000, true, 0),
+        req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r2", "r1", 3_000.0),
+    ]);
+    let (_, ev) = cache_of(sp);
+    assert_eq!((ev[0].dropped, ev[0].post_requests, ev[0].break_even, ev[0].savings), (0, 2, None, 0.0));
+    assert!(close(ev[0].net, -0.15));
+    // cost.cacheRead missing: the rate is 0, so nothing is saved and the break-even is unknown
+    let sp = parse(vec![
+        comp("c1", None, 1_000.0, 100_000, true, 0),
+        req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), None, 0.15, "stop"),
+        req("r2", Some("r1"), 3_000.0, (10, 30_000, 0), None, 0.0, "stop"),
+    ]);
+    let (_, ev) = cache_of(sp);
+    assert_eq!((ev[0].dropped, ev[0].post_requests, ev[0].break_even, ev[0].savings), (70_000, 2, None, 0.0));
+    // nothing read at all: rate unknown
+    let sp = parse(vec![comp("c1", None, 1_000.0, 100_000, true, 0), req("r1", Some("c1"), 2_000.0, (0, 0, 30_000), Some(0.0), 0.15, "stop")]);
+    let e = &sp.cache_events[0];
+    assert_eq!((e.rate(), e.break_even(), e.savings()), (None, None, 0.0));
+    // no later request at all
+    let sp = parse(vec![comp("c1", None, 1_000.0, 100_000, true, 0)]);
+    assert_eq!((sp.cache_events[0].post_requests, sp.cache_events[0].break_even()), (0, None));
 }

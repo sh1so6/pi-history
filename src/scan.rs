@@ -15,7 +15,7 @@ pub const SUBAGENT_MARK: &str = "Temp-pi-agent-";
 pub const SEARCH_TEXT_MAX: usize = 20000;
 pub const FIRST_PROMPT_MAX: usize = 200;
 const BIG_LINE: usize = 2000;
-const CACHE_VERSION: u64 = 3;
+const CACHE_VERSION: u64 = 4;
 /// How many parent hops to follow when folding a sub-agent session into its owner's project.
 const MAX_PARENT_HOPS: usize = 10;
 
@@ -345,6 +345,8 @@ struct Cost {
     total: Option<f64>,
     #[serde(default, rename = "cacheWrite", deserialize_with = "lenient::number")]
     cache_write: Option<f64>,
+    #[serde(default, rename = "cacheRead", deserialize_with = "lenient::number")]
+    cache_read: Option<f64>,
 }
 #[derive(Deserialize, Default)]
 struct Usage {
@@ -578,6 +580,7 @@ fn asst_rec(m: &Message) -> Option<AsstRec> {
         cw,
         cw1h: tokens(u.cache_write_1h),
         cost_cw: num(u.cost.0.as_ref().and_then(|c| c.cache_write)),
+        cost_cr: num(u.cost.0.as_ref().and_then(|c| c.cache_read)),
     })
 }
 
@@ -1633,7 +1636,7 @@ pub mod tests {
         let r1 = scan_sessions(&opts);
         assert_eq!(r1.parsed, 1);
         let c = load_cache(&cache);
-        assert_eq!(c.version, 3);
+        assert_eq!(c.version, 4);
         let cf = c.files.values().next().unwrap();
         assert_eq!(cf.parent_session, "/x/y.jsonl");
         assert_eq!(cf.daily.len(), 1);

@@ -17,6 +17,22 @@ pub const API_ANTHROPIC: &str = "anthropic-messages";
 /// A relay-log line matches an event when the session ids agree and the times differ by at most this (ms).
 pub const TRIGGER_MATCH_MS: i64 = 120_000;
 
+/* Break-even ("損益分岐") of a relay / compaction event.
+ *
+ * Every compaction owns an *epoch*: each tree entry carries `epoch: Option<event index>`, inherited from its parent
+ * entry; a compaction entry sets its own event as the epoch. So an epoch lasts until the next compaction on the same
+ * ancestor chain (branches follow their own ancestors).
+ * Every valid assistant request in an epoch (including the first one after the compaction) adds to the event:
+ * `post_requests += 1`, `post_cache_read += cacheRead`, `post_cache_read_cost += cost.cacheRead`.
+ *   rate       = post_cache_read_cost / post_cache_read                (unknown when post_cache_read == 0)
+ * Counterfactual: without the compaction every later request would have cache-read `dropped` more tokens, so
+ *   savings    = post_requests * dropped * rate                        (USD; 0 when the rate is unknown)
+ *   net        = savings - recache_cost
+ *   break_even = recache_cost / (dropped * rate)  [requests]           (None when dropped == 0 or the rate is unknown)
+ * `open`: the event is the LAST compaction of its session file (still in progress, or the session ended there);
+ * its numbers may still grow. Earlier events of the file are closed.
+ * These are derived in `build_cache`; only the three `post_*` sums are stored in the cache file. */
+
 /// Per (local date) miss counters of one session; stored in the cache file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -44,6 +60,28 @@ pub struct CacheEventRow {
     pub dropped: u64,
     pub recache: u64,
     pub recache_cost: f64,
+    /// valid requests of the epoch (see above), their cacheRead tokens and cacheRead cost
+    pub post_requests: u64,
+    pub post_cache_read: u64,
+    pub post_cache_read_cost: f64,
+}
+
+impl CacheEventRow {
+    /// USD per cache-read token observed after the event (None: nothing was read).
+    pub fn rate(&self) -> Option<f64> {
+        (self.post_cache_read > 0).then(|| self.post_cache_read_cost / self.post_cache_read as f64)
+    }
+    pub fn savings(&self) -> f64 {
+        self.rate().map_or(0.0, |r| self.post_requests as f64 * self.dropped as f64 * r)
+    }
+    pub fn net(&self) -> f64 {
+        self.savings() - self.recache_cost
+    }
+    /// Requests needed to pay the recache back (None when it cannot be computed).
+    pub fn break_even(&self) -> Option<f64> {
+        let per_request = self.rate()? * self.dropped as f64;
+        (per_request > 0.0).then(|| self.recache_cost / per_request)
+    }
 }
 
 /// A valid assistant response (has usage, not error/aborted, some context tokens).
@@ -59,12 +97,21 @@ pub struct AsstRec {
     pub cw: u64,
     pub cw1h: u64,
     pub cost_cw: f64,
+    /// `cost.cacheRead`
+    pub cost_cr: f64,
 }
 
 struct Asst {
     rec: AsstRec,
     /// the most recent cache write on the chain (this message's if it wrote, else inherited) was a 1h write
     tier1h: bool,
+}
+
+/// Tree entry as seen by its children: the predecessor and the epoch.
+#[derive(Clone, Copy)]
+struct Node {
+    prev: Prev,
+    epoch: Option<usize>,
 }
 
 /// What the children of an entry see as their predecessor.
@@ -115,7 +162,7 @@ fn classify(p: &Asst, a: &AsstRec) -> Option<Miss> {
 
 #[derive(Default)]
 pub struct CacheTracker {
-    nodes: HashMap<String, Prev>,
+    nodes: HashMap<String, Node>,
     assts: Vec<Asst>,
     events: Vec<CacheEventRow>,
     done: Vec<bool>,
@@ -123,14 +170,14 @@ pub struct CacheTracker {
 }
 
 impl CacheTracker {
-    fn prev_of(&self, parent: Option<&str>) -> Prev {
-        parent.and_then(|p| self.nodes.get(p)).copied().unwrap_or(Prev::None)
+    fn node_of(&self, parent: Option<&str>) -> Node {
+        parent.and_then(|p| self.nodes.get(p)).copied().unwrap_or(Node { prev: Prev::None, epoch: None })
     }
 
     /// Any entry that is neither a valid assistant message nor a compaction: transparent for the chain.
     pub fn other(&mut self, id: &str, parent: Option<&str>) {
-        let p = self.prev_of(parent);
-        self.nodes.insert(id.to_string(), p);
+        let n = self.node_of(parent);
+        self.nodes.insert(id.to_string(), n);
     }
 
     /// A compaction cuts the chain: its descendants have no predecessor beyond it.
@@ -144,16 +191,23 @@ impl CacheTracker {
             ..Default::default()
         });
         self.done.push(false);
-        self.nodes.insert(id.to_string(), Prev::Compaction(idx));
+        self.nodes.insert(id.to_string(), Node { prev: Prev::Compaction(idx), epoch: Some(idx) });
     }
 
     /// An assistant message; `rec` is None when it is not a valid response (then it is transparent).
     pub fn assistant(&mut self, id: &str, parent: Option<&str>, ts: &str, rec: Option<AsstRec>) {
-        let prev = self.prev_of(parent);
+        let node = self.node_of(parent);
+        let prev = node.prev;
         let Some(a) = rec else {
-            self.nodes.insert(id.to_string(), prev);
+            self.nodes.insert(id.to_string(), node);
             return;
         };
+        if let Some(e) = node.epoch {
+            let e = &mut self.events[e];
+            e.post_requests += 1;
+            e.post_cache_read += a.cr;
+            e.post_cache_read_cost += a.cost_cr;
+        }
         let inherited_tier = match prev {
             Prev::Asst(i) => self.assts[i].tier1h,
             _ => false,
@@ -178,7 +232,7 @@ impl CacheTracker {
         }
         let tier1h = if a.cw > 0 { a.cw1h > 0 } else { inherited_tier };
         self.assts.push(Asst { rec: a, tier1h });
-        self.nodes.insert(id.to_string(), Prev::Asst(self.assts.len() - 1));
+        self.nodes.insert(id.to_string(), Node { prev: Prev::Asst(self.assts.len() - 1), epoch: node.epoch });
     }
 
     fn record_miss(&mut self, ts: &str, m: Miss) {
@@ -228,12 +282,16 @@ pub struct CacheRow {
     pub relay_dropped: u64,
     pub relay_recache: u64,
     pub relay_recache_cost: f64,
+    pub relay_post_requests: u64,
+    pub relay_savings: f64,
     pub compacts: u64,
     pub compact_before: u64,
     pub compact_after: u64,
     pub compact_dropped: u64,
     pub compact_recache: u64,
     pub compact_recache_cost: f64,
+    pub compact_post_requests: u64,
+    pub compact_savings: f64,
 }
 
 impl CacheRow {
@@ -256,6 +314,11 @@ pub struct CacheEvent {
     pub dropped: u64,
     pub recache: u64,
     pub recache_cost: f64,
+    pub post_requests: u64,
+    pub savings: f64,
+    pub net: f64,
+    pub break_even: Option<f64>,
+    pub open: bool,
     pub sid: String,
     pub trigger: Option<String>,
 }
@@ -327,7 +390,8 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
             r.miss_model += d.miss_model;
             r.miss_model_tokens += d.miss_model_tokens;
         }
-        for e in &s.spend.cache_events {
+        let last = s.spend.cache_events.len().saturating_sub(1);
+        for (k, e) in s.spend.cache_events.iter().enumerate() {
             let r = row(&mut agg, &e.date, project, sub);
             if e.kind == "relay" {
                 r.relays += 1;
@@ -336,6 +400,8 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 r.relay_dropped += e.dropped;
                 r.relay_recache += e.recache;
                 r.relay_recache_cost += e.recache_cost;
+                r.relay_post_requests += e.post_requests;
+                r.relay_savings += e.savings();
             } else {
                 r.compacts += 1;
                 r.compact_before += e.before;
@@ -343,6 +409,8 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 r.compact_dropped += e.dropped;
                 r.compact_recache += e.recache;
                 r.compact_recache_cost += e.recache_cost;
+                r.compact_post_requests += e.post_requests;
+                r.compact_savings += e.savings();
             }
             events.push(CacheEvent {
                 ts: e.ts.clone(),
@@ -355,6 +423,11 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 dropped: e.dropped,
                 recache: e.recache,
                 recache_cost: e.recache_cost,
+                post_requests: e.post_requests,
+                savings: e.savings(),
+                net: e.net(),
+                break_even: e.break_even(),
+                open: k == last,
                 sid: s.entry.id.clone(),
                 trigger: None,
             });
