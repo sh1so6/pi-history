@@ -30,7 +30,7 @@ pi-history --no-dialog     # ダイアログを一切出さない（エラーは
 （`sessions` 自体を選んだ場合は親が agentDir）。`sessions` を含まないフォルダを選ぶとエラーを出して再選択になり、キャンセルすると終了します。
 選んだ agentDir は `app.json` に保存され、以降は聞きません。初期フォルダは `~/.pi`（あれば）。
 
-- `app.json` の場所: Windows `%APPDATA%\pi-historypp.json` / macOS `~/Library/Application Support/pi-history/app.json` / その他 `$XDG_CONFIG_HOME`（なければ `~/.config`）`/pi-history/app.json`。形式は `{ "agentDir": "C:\Users\you\.pi\agent" }`。壊れていれば無視します。`PI_HISTORY_CONFIG_DIR` でフォルダを差し替え可能（テスト用）。
+- `app.json` の場所: Windows `%APPDATA%\pi-history\app.json` / macOS `~/Library/Application Support/pi-history/app.json` / その他 `$XDG_CONFIG_HOME`（なければ `~/.config`）`/pi-history/app.json`。形式は `{ "agentDir": "C:\\Users\\you\\.pi\\agent" }`。壊れていれば無視します。`PI_HISTORY_CONFIG_DIR` でフォルダを差し替え可能（テスト用）。
 - ダイアログは常駐化の前に、ユーザーが起動した側のプロセスで出します。選んだ agentDir は常駐側へ `--agent-dir` で渡します。`stop` はダイアログを出しません（`sessions` が無ければ「server is not running」）。
 - sessions が見つからない・選択キャンセルなどの致命エラーは、標準エラーに加えてメッセージボックスでも表示します（コンソールが即閉じても分かるように）。
 - `--no-dialog`、`PI_SESSION_HISTORY_NO_DIALOG=1`、`PI_SESSION_HISTORY_NO_OPEN=1` のいずれかがあるとダイアログ／メッセージボックスを一切出さず、標準エラーのみで終了コード 1 になります（自動テスト・CI 向け）。
