@@ -1,6 +1,5 @@
 //! Config file, CLI argument parsing and agent-dir resolution.
 use serde_json::Value;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -71,34 +70,6 @@ pub fn parse_args(args: &str) -> ParsedArgs {
         joined
     };
     ParsedArgs::Open { project, all }
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let v = std::env::var_os("USERPROFILE");
-    #[cfg(not(windows))]
-    let v = std::env::var_os("HOME");
-    v.filter(|s| !s.is_empty()).map(PathBuf::from)
-}
-
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(home) = home_dir() {
-        if p == "~" {
-            return home;
-        }
-        if let Some(rest) = p.strip_prefix("~/").or_else(|| if cfg!(windows) { p.strip_prefix("~\\") } else { None }) {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(p)
-}
-
-/// `PI_CODING_AGENT_DIR` (with `~` expansion) or `~/.pi/agent` — same as Pi's `getAgentDir()`.
-pub fn agent_dir() -> PathBuf {
-    match std::env::var("PI_CODING_AGENT_DIR") {
-        Ok(v) if !v.is_empty() => expand_tilde(&v),
-        _ => home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".pi").join("agent"),
-    }
 }
 
 #[cfg(test)]

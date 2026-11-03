@@ -9,3 +9,10 @@ rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 tiny_http = "0.12.0"
+
+# ネイティブのフォルダ選択・メッセージボックス。Windows は Win32 (IFileOpenDialog) を直接使うので追加機能は不要。
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+[target.'cfg(not(windows))'.dependencies]
+rfd = "0.17"

@@ -11,7 +11,29 @@ pi-history <text>          # プロジェクト名に <text> を含むものへ�
 pi-history all [<text>]    # サブエージェント一時フォルダ（フォルダ名に Temp-pi-agent-）も含める
 pi-history stop            # 常駐サーバを停止
 pi-history --foreground    # バックグラウンド化せずこのプロセスでサーブ（-f）
+pi-history --agent-dir <path>  # agent フォルダ（`sessions` を含む）を直接指定
+pi-history --pick-dir      # フォルダ選択ダイアログで選び直す（保存済みでも上書き）
+pi-history --no-dialog     # ダイアログを一切出さない（エラーは標準エラーのみ）
 ```
+
+### 単体起動（ダブルクリック）とフォルダ選択
+
+引数も `PI_CODING_AGENT_DIR` も無しで exe を起動しても使えます。agentDir は次の順で決まります。
+
+1. `--agent-dir <path>`（`--agent-dir=<path>` も可）
+2. 環境変数 `PI_CODING_AGENT_DIR`
+3. アプリ設定 `app.json` の `agentDir`
+4. 既定 `~/.pi/agent`
+
+決まった agentDir に `sessions` フォルダが無い場合（または `--pick-dir` 指定時）は、OS ネイティブのフォルダ選択ダイアログ
+（Windows は Explorer 形式）が開きます。「Pi の agent フォルダ（`sessions` を含む）」か「`sessions` フォルダ自体」を選んでください
+（`sessions` 自体を選んだ場合は親が agentDir）。`sessions` を含まないフォルダを選ぶとエラーを出して再選択になり、キャンセルすると終了します。
+選んだ agentDir は `app.json` に保存され、以降は聞きません。初期フォルダは `~/.pi`（あれば）。
+
+- `app.json` の場所: Windows `%APPDATA%\pi-historypp.json` / macOS `~/Library/Application Support/pi-history/app.json` / その他 `$XDG_CONFIG_HOME`（なければ `~/.config`）`/pi-history/app.json`。形式は `{ "agentDir": "C:\Users\you\.pi\agent" }`。壊れていれば無視します。`PI_HISTORY_CONFIG_DIR` でフォルダを差し替え可能（テスト用）。
+- ダイアログは常駐化の前に、ユーザーが起動した側のプロセスで出します。選んだ agentDir は常駐側へ `--agent-dir` で渡します。`stop` はダイアログを出しません（`sessions` が無ければ「server is not running」）。
+- sessions が見つからない・選択キャンセルなどの致命エラーは、標準エラーに加えてメッセージボックスでも表示します（コンソールが即閉じても分かるように）。
+- `--no-dialog`、`PI_SESSION_HISTORY_NO_DIALOG=1`、`PI_SESSION_HISTORY_NO_OPEN=1` のいずれかがあるとダイアログ／メッセージボックスを一切出さず、標準エラーのみで終了コード 1 になります（自動テスト・CI 向け）。
 
 - 2 回目以降の起動は既存サーバを再利用します（再スキャンさせてからページを開くだけ）。
 - ポート／PID／トークンは `<agentDir>/session-history/server.json`。`stop` はこのトークン付きで `/api/shutdown` を呼び、止まらなければ PID を kill します。server.json が古い（プロセスが無い）場合は自動で作り直します。
@@ -23,8 +45,10 @@ pi-history --foreground    # バックグラウンド化せずこのプロセス
 | 名前 | 内容 |
 |---|---|
 | `<agentDir>/session-history.json` | `{ "includeSubagents": false, "port": 0 }`（毎回読む。port 0 = 空きポート） |
-| `PI_CODING_AGENT_DIR` | agentDir（既定 `~/.pi/agent`、`~` 展開あり） |
-| `PI_SESSION_HISTORY_NO_OPEN=1` | ブラウザを開かず URL を表示するだけ |
+| `PI_CODING_AGENT_DIR` | agentDir（`--agent-dir` の次に優先。既定 `~/.pi/agent`、`~` 展開あり） |
+| `PI_SESSION_HISTORY_NO_DIALOG=1` | ダイアログ／メッセージボックスを出さない（`--no-dialog` と同じ） |
+| `PI_HISTORY_CONFIG_DIR` | `app.json` を置くフォルダの上書き |
+| `PI_SESSION_HISTORY_NO_OPEN=1` | ブラウザを開かず URL を表示するだけ（ダイアログも出さない） |
 | `PI_SESSION_HISTORY_PI_CLI` | Pi の `cli.js` を指定（node 経由で起動） |
 | `PI_SESSION_HISTORY_NO_INJECT=1` | `/session/<id>` に見やすさ改善の CSS/JS を注入せず、素の `pi --export` HTML を返す |
 

@@ -1,13 +1,15 @@
 //! pi-history: browse past Pi sessions in the browser (list + search + calendar filter).
 //! Port of the `session-history.ts` Pi extension as a standalone executable. See README.md.
+mod agentdir;
 mod config;
+mod dialog;
 mod export;
 mod inject;
 mod prefs;
 mod scan;
 mod server;
 
-use config::{agent_dir, load_config, parse_args, ParsedArgs};
+use config::{load_config, parse_args, ParsedArgs};
 use serde::{Deserialize, Serialize};
 use server::{scan_snapshot, serve, AppState, TOKEN_HEADER};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,10 +29,17 @@ const HELP: &str = "pi-history [stop|all|<project substring>]  (alias: pi-histor
 
 Options:
   --foreground, -f   run the server in this process instead of in the background
+  --agent-dir <path> use this agent dir (the folder that contains `sessions`)
+  --pick-dir         choose the agent dir in a folder dialog (overrides the saved one)
+  --no-dialog        never show dialogs; errors go to stderr only
   --help, -h         this help
   --version, -V      version
 
-Env: PI_CODING_AGENT_DIR (agent dir), PI_SESSION_HISTORY_NO_OPEN=1 (do not open the browser),
+agent dir order: --agent-dir > PI_CODING_AGENT_DIR > app.json (%APPDATA%\\pi-history\\app.json) > ~/.pi/agent.
+If <agentDir>/sessions does not exist a folder dialog asks for it and saves the choice to app.json.
+
+Env: PI_CODING_AGENT_DIR (agent dir), PI_SESSION_HISTORY_NO_OPEN=1 (do not open the browser; also no dialogs),
+     PI_SESSION_HISTORY_NO_DIALOG=1 (no dialogs), PI_HISTORY_CONFIG_DIR (dir of app.json),
      PI_SESSION_HISTORY_PI_CLI (path to Pi's cli.js for `pi --export`)
 Config: <agentDir>/session-history.json  { \"includeSubagents\": false, \"port\": 0 }";
 
@@ -241,11 +250,11 @@ fn uninherit_std_handles() {
     }
 }
 
-fn spawn_daemon(include: bool) -> Result<(u16, [u64; 4]), String> {
+fn spawn_daemon(agent: &Path, include: bool) -> Result<(u16, [u64; 4]), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let build = |breakaway: bool| {
         let mut cmd = Command::new(&exe);
-        cmd.arg("--daemon-child");
+        cmd.arg("--daemon-child").arg("--agent-dir").arg(agent);
         if include {
             cmd.arg("--sub");
         }
@@ -372,7 +381,7 @@ fn cmd_open(agent: &Path, project: &str, all: bool, foreground: bool) -> i32 {
         serve(state, srv, 16);
         return 0;
     }
-    match spawn_daemon(include) {
+    match spawn_daemon(agent, include) {
         Ok((port, [sessions, parsed, cached, ms])) => {
             let url = page_url(port, project);
             announce(sessions, parsed, cached, ms, false, &url);
@@ -388,12 +397,30 @@ fn cmd_open(agent: &Path, project: &str, all: bool, foreground: bool) -> i32 {
     }
 }
 
+/// 致命エラー: 標準エラーに出し、ダイアログ可なら（コンソールが即閉じても分かるよう）メッセージボックスも出す。
+fn fatal(msg: &str, dialogs: bool) -> i32 {
+    log(&format!("history: {msg}"));
+    if dialogs {
+        dialog::message_box(agentdir::APP_TITLE, msg);
+    }
+    1
+}
+
+fn dialogs_allowed(no_dialog_flag: bool) -> bool {
+    let env_on = |k: &str| std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+    !(no_dialog_flag || env_on("PI_SESSION_HISTORY_NO_DIALOG") || no_open())
+}
+
 fn run() -> i32 {
     let mut foreground = false;
     let mut daemon_child = false;
     let mut sub = false;
+    let mut pick_dir = false;
+    let mut no_dialog = false;
+    let mut cli_agent: Option<String> = None;
     let mut words: Vec<String> = Vec::new();
-    for a in std::env::args().skip(1) {
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -406,16 +433,35 @@ fn run() -> i32 {
             "-f" | "--foreground" => foreground = true,
             "--daemon-child" => daemon_child = true,
             "--sub" => sub = true,
-            _ => words.push(a),
+            "--pick-dir" => pick_dir = true,
+            "--no-dialog" => no_dialog = true,
+            "--agent-dir" => match it.next() {
+                Some(v) => cli_agent = Some(v),
+                None => return fatal("--agent-dir にはパスが必要です", false),
+            },
+            _ => match a.strip_prefix("--agent-dir=") {
+                Some(v) => cli_agent = Some(v.to_string()),
+                None => words.push(a),
+            },
         }
     }
-    let agent = agent_dir();
+    let dialogs = dialogs_allowed(no_dialog);
+    let resolved = agentdir::resolve_from_environment(cli_agent.as_deref());
     if daemon_child {
-        return run_daemon_child(&agent, sub);
+        // 常駐側ではダイアログを出さない（親が決定済みの agentDir を --agent-dir で渡してくる）
+        return run_daemon_child(&resolved.0, sub);
     }
     match parse_args(&words.join(" ")) {
-        ParsedArgs::Stop => cmd_stop(&agent),
-        ParsedArgs::Open { project, all } => cmd_open(&agent, &project, all, foreground),
+        // stop はダイアログを出さない。sessions が無ければ server.json も無い＝動いていない
+        ParsedArgs::Stop => cmd_stop(&resolved.0),
+        ParsedArgs::Open { project, all } => {
+            let opts = agentdir::Options { pick_dir, dialogs };
+            let agent = match agentdir::ensure_agent_dir(&opts, resolved, agentdir::app_json_path().as_deref(), agentdir::home_dir().as_deref(), &mut dialog::NativeUi) {
+                Ok(a) => a,
+                Err(e) => return fatal(&e, dialogs),
+            };
+            cmd_open(&agent, &project, all, foreground)
+        }
     }
 }
 
