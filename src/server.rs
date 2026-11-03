@@ -191,6 +191,14 @@ pub fn handle(state: &Arc<AppState>, req: Request) {
             return send_html(req, 404, "session not found in the index", &[]);
         };
         return match ensure_session_html(&entry.id, std::path::Path::new(&entry.file), &state.html_dir, &*state.exporter) {
+            // decorate at serve time (the cached export file stays untouched); PI_SESSION_HISTORY_NO_INJECT=1 serves it as is
+            Ok(out) if !crate::inject::disabled() => match std::fs::read(&out) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(html) => send(req, 200, HTML, crate::inject::inject(&html).into_bytes(), &[]),
+                    Err(e) => send(req, 200, HTML, e.into_bytes(), &[]),
+                },
+                Err(e) => send_html(req, 500, &format!("HTML export failed\n{e}"), &[]),
+            },
             Ok(out) => match std::fs::File::open(&out) {
                 Ok(f) => {
                     let mut r = Response::from_file(f).with_status_code(200);
@@ -349,7 +357,11 @@ mod tests {
         assert_eq!(c, 405);
         assert!(h.contains("Allow: GET, HEAD"));
         let (c, _, b) = request(port, "GET", "/session/s1", None, &[]);
-        assert_eq!((c, b.as_str()), (200, "<html>session</html>"));
+        assert_eq!(c, 200);
+        // injected at serve time (no </head>/</body> in the stub: style first, script last), cached file untouched
+        assert!(b.starts_with(crate::inject::MARKER) && b.contains("<html>session</html>") && b.ends_with("</script>\n"));
+        let cached = std::fs::read_to_string(state.html_dir.join(format!("{}.html", state.snapshot().index.entries[0].id))).unwrap();
+        assert_eq!(cached, "<html>session</html>");
         assert_eq!(request(port, "GET", "/session/nope", None, &[]).0, 404);
         assert_eq!(request(port, "GET", "/session/..%2F..%2Fwindows%2Fwin.ini", None, &[]).0, 404);
         assert_eq!(request(port, "GET", &format!("/session/{}", crate::scan::encode_uri_component(&state.snapshot().index.entries[0].file)), None, &[]).0, 404);

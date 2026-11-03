@@ -1,0 +1,94 @@
+/* pi-history: injected at serve time into the `pi --export` HTML. Only uses the export's own CSS variables. */
+:root {
+  --line-height: 22px;
+  --pi-max: 980px;
+  --pi-sans: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Noto Sans JP", sans-serif;
+  --pi-mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, "BIZ UDGothic", "MS Gothic", "DejaVu Sans Mono", monospace;
+  --pi-tint: rgba(128, 128, 128, 0.10);
+  --pi-line: rgba(128, 128, 128, 0.30);
+}
+body { font-family: var(--pi-mono); font-size: 13px; }
+
+/* the page scrolls, not #content (its height is unbounded); overflow:auto there would stop position:sticky from working */
+#content { overflow-y: visible; }
+
+/* reading width and prose */
+@media (min-width: 901px) {
+  #content > * { max-width: var(--pi-max); }
+}
+.assistant-text, .user-message .markdown-content, .user-message > div:not(.message-timestamp):not(.message-images),
+.branch-summary .markdown-content, .hook-message .markdown-content, .compaction-content, .skill-invocation-content {
+  font-family: var(--pi-sans);
+  font-size: 14.5px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+.markdown-content p + p { margin-top: 0.8em; }
+.markdown-content ul, .markdown-content ol { margin: 0.5em 0; line-height: 1.7; }
+.markdown-content li + li { margin-top: 0.2em; }
+.markdown-content code, .markdown-content pre, .markdown-content pre code {
+  font-family: var(--pi-mono);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.markdown-content pre { background: var(--pi-tint); border: 1px solid var(--pi-line); border-radius: 4px; padding: 8px 12px; }
+.markdown-content pre code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content table { display: block; max-width: 100%; overflow-x: auto; }
+.markdown-content img { max-width: 100%; height: auto; }
+
+/* cards: the exported theme often uses one flat background for everything */
+.user-message {
+  background-image: linear-gradient(var(--pi-tint), var(--pi-tint));
+  border-left: 3px solid var(--accent, var(--dim));
+  padding: 12px 16px;
+}
+.tool-execution {
+  border: 1px solid var(--pi-line);
+  border-left: 3px solid var(--pi-line);
+  padding: 8px 12px;
+  overflow-wrap: anywhere;
+}
+.tool-execution.success { border-left-color: var(--success, var(--pi-line)); }
+.tool-execution.error { border-left-color: var(--error, var(--pi-line)); }
+.tool-command { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.tool-output { margin-top: 8px; }
+.tool-output.expandable.expanded .output-full { max-height: 70vh; overflow: auto; }
+.assistant-message > .tool-execution { margin-top: 8px; }
+.assistant-text + .tool-execution { margin-top: 10px; }
+
+/* thinking: dim, click a block to open/close it */
+.thinking-block { cursor: pointer; border-left: 2px solid var(--pi-line); margin: 6px 0 6px 12px; }
+.thinking-block .thinking-text { font-family: var(--pi-sans); line-height: 1.65; padding-top: 4px; padding-bottom: 4px; }
+.thinking-block .thinking-collapsed { padding-top: 2px; padding-bottom: 2px; }
+.thinking-collapsed::after { content: "  ▸ 展開"; opacity: 0.7; font-style: normal; font-size: 11px; }
+.thinking-block.pi-open .thinking-text { display: block !important; }
+.thinking-block.pi-open .thinking-collapsed { display: none !important; }
+
+/* per-message usage badge */
+.pi-usage {
+  margin-left: 8px; padding: 0 6px; border: 1px solid var(--pi-line); border-radius: 10px;
+  font-size: 10px; color: var(--dim); white-space: nowrap;
+}
+.pi-usage b { font-weight: 600; color: var(--text); }
+
+/* sticky summary bar */
+#pi-bar {
+  position: sticky; top: 0; z-index: 5; width: 100%;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  margin-bottom: 12px; padding: 6px 12px;
+  background: var(--body-bg, Canvas); color: var(--dim);
+  border: 1px solid var(--pi-line); border-radius: 4px;
+  font-family: var(--pi-sans); font-size: 12px; line-height: 1.5;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+#pi-bar a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; font-weight: 600; }
+#pi-bar a:hover { color: var(--accent, var(--text)); }
+#pi-bar .pi-item b { color: var(--text); font-weight: 600; margin-left: 3px; }
+#pi-bar .pi-grow { flex: 1; }
+#pi-bar button {
+  font: inherit; font-size: 11px; padding: 0 8px; cursor: pointer; border-radius: 3px;
+  background: transparent; color: var(--dim); border: 1px solid var(--pi-line);
+}
+#pi-bar button[aria-pressed="true"] { color: var(--text); border-color: var(--text); }
+@media (max-width: 900px) { #pi-bar { padding-left: 44px; } }
+@media print { #pi-bar { display: none !important; } }

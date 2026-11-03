@@ -26,8 +26,44 @@ pi-history --foreground    # バックグラウンド化せずこのプロセス
 | `PI_CODING_AGENT_DIR` | agentDir（既定 `~/.pi/agent`、`~` 展開あり） |
 | `PI_SESSION_HISTORY_NO_OPEN=1` | ブラウザを開かず URL を表示するだけ |
 | `PI_SESSION_HISTORY_PI_CLI` | Pi の `cli.js` を指定（node 経由で起動） |
+| `PI_SESSION_HISTORY_NO_INJECT=1` | `/session/<id>` に見やすさ改善の CSS/JS を注入せず、素の `pi --export` HTML を返す |
 
-キャッシュ `<agentDir>/session-history/cache.json` は TS 版と JSON 互換（`{version:1, files:{<path>:{mtimeMs,size,entry}}}`）で、そのまま読み書きできます。
+キャッシュ `<agentDir>/session-history/cache.json` は `{version:2, files:{<path>:{mtimeMs,size,entry,parentSession?,daily?}}}`。`entry` は従来どおり（TS 版と同形）ですが、`version` が違う旧キャッシュは捨てて全再パースします（TS 版とはもう共有しません）。
+
+## 支出（`spend`）
+
+一覧の上の「期間の支出」パネルは `/api/index` のトップレベル `spend` 配列から作ります（既存の `entries` などの形状は不変）。
+
+```
+spend: [{date, project, model, input, output, cacheRead, cacheWrite, cost, messages, sub}]
+```
+
+- **日付基準**: jsonl の assistant メッセージ（と `type:"usage"` 行）の `timestamp` を**このマシンのローカル日付**（`YYYY-MM-DD`）に直したもの。セッション開始日ではなく、日をまたぐセッションはメッセージごとに日別に割れます。キャッシュには日付を確定して保存するため、タイムゾーンを変えた場合は cache.json を消すと再計算されます。
+- 集計単位は (date, project, model, sub)。`cost` は `usage.cost.total`、トークンは `usage.input/output/cacheRead/cacheWrite`。`messages` は assistant 応答数（`usage` 行は 0）。timestamp が無い行は直前の行の日付、model が無ければ `unknown`。
+- `project` は一覧と同じ規則（cwd 末尾 2 セグメント、なければフォルダ名）。全期間の `cost` 合計は各セッションの `cost` の総和（サブエージェント含む）と一致します。
+- **サブエージェント**（フォルダ名に `Temp-pi-agent-`）の支出は、先頭ヘッダの `parentSession` を再帰的にたどり、サブエージェントでない最初のセッションの project に合算し `sub:true` を付けます（最大 10 ホップ・循環検出あり。親が見つからない／辿れない場合は元の project 名のまま別扱い）。通常セッションの `parentSession`（relay / fork）は独立した project のままで親には寄せません。
+- `includeSubagents`（既定 false）でも `spend` にはサブエージェント分を必ず含めます（一覧の行が隠れるだけ。スキャンは常に全フォルダを見ます）。
+- パネルはカレンダーで選んだ日／範囲（未選択は全期間）とプロジェクト絞り込みに従い、**検索語は適用しません**。
+
+## 個別セッション画面の見やすさ改善（配信時注入）
+
+`GET /session/<id>` は、キャッシュ済みの export HTML を**書き換えず**、レスポンス生成時に
+`src/inject.css` を最初の `</head>` の直前、`src/inject.js` を最後の `</body>` の直前へ挿入して返します
+（`src/inject.rs` の `inject()`。`</head>` が無ければ先頭、`</body>` が無ければ末尾。マーカー `<!--pi-history-inject-->` で二重注入防止）。
+CSS/JS を直しても export の再生成は不要で、再ビルド（`include_str!`）だけです。外部リソースは使いません。
+問題があれば `PI_SESSION_HISTORY_NO_INJECT=1` で素の export を表示できます。
+
+- 読みやすさ: 本文幅 800→980px、本文は日本語に向くサンセリフ（コード・ツール出力は等幅）、行間拡大、コードブロック折返し、
+  user/tool のカード化（テーマの背景が単色でも区別できる）、展開したツール出力は最大 `70vh` でスクロール。
+- thinking は既定で折りたたみ（ブロックをクリックで個別に展開。`T` や上部バーの `thinking` ボタンで全体切替）。ツール出力は export 本来の既定（先頭数行＋展開）のまま。
+- 上部に固定の要約バー: `← 一覧に戻る`（`/`）、プロジェクト、期間、メッセージ数（user / assistant / tool calls）、コスト、トークン（↑in ↓out R=cacheRead W=cacheWrite）、モデル、thinking/tools 切替。
+- 各 assistant メッセージの時刻の横に小バッジ（そのメッセージの cost とトークン）。
+- 依存する export の構造: `#session-data`（base64 の JSON。`entries[].message.usage/model`, `header`）、`#content` / `#messages`、
+  `.assistant-message#entry-<id>`、`.thinking-block/.thinking-text/.thinking-collapsed`、`.tool-execution`、`.markdown-content`、
+  ヘッダーの `[data-action=toggle-thinking|toggle-tools]`。
+- フェイルセーフ: 機能ごとに try/catch。セレクタやデータ形状が想定と違えば何もしない（元の表示のまま）。
+  配色は export の CSS 変数（`--text` `--dim` `--accent` `--body-bg` …）に追従するため、ダーク/ライトも export のテーマのまま。
+- 見た目の比較画像: `docs/session-before.png`（素の export）/ `docs/session-after.png`（注入後）/ `docs/session-after-mobile.png`（幅 480px）。
 
 ## Pi CLI への依存
 

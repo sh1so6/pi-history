@@ -2,6 +2,7 @@
 //! Port of the `session-history.ts` Pi extension as a standalone executable. See README.md.
 mod config;
 mod export;
+mod inject;
 mod scan;
 mod server;
 
