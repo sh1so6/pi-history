@@ -15,7 +15,7 @@ pub const SUBAGENT_MARK: &str = "Temp-pi-agent-";
 pub const SEARCH_TEXT_MAX: usize = 20000;
 pub const FIRST_PROMPT_MAX: usize = 200;
 const BIG_LINE: usize = 2000;
-const CACHE_VERSION: u64 = 4;
+const CACHE_VERSION: u64 = 5;
 /// How many parent hops to follow when folding a sub-agent session into its owner's project.
 const MAX_PARENT_HOPS: usize = 10;
 
@@ -402,6 +402,8 @@ struct Details {
 /// Only what the cache statistics need of a compaction line (the rest, `summary` / `systemMessage` ..., is skipped unparsed).
 #[derive(Deserialize, Default)]
 struct CompactionLine {
+    #[serde(default, rename = "parentId", deserialize_with = "lenient::string")]
+    parent_id: Option<String>,
     #[serde(default, deserialize_with = "lenient::string")]
     timestamp: Option<String>,
     #[serde(default, deserialize_with = "lenient::string")]
@@ -435,6 +437,9 @@ struct Line {
     parent_session: Option<String>,
     #[serde(default, deserialize_with = "lenient::string")]
     model: Option<String>,
+    /// `usage` entries: e.g. "cache_warm"
+    #[serde(default, deserialize_with = "lenient::string")]
+    kind: Option<String>,
     #[serde(default)]
     usage: Obj<Usage>,
     #[serde(default)]
@@ -631,7 +636,7 @@ impl SessionAccumulator {
                             }
                             if let Some(id) = c.id.as_deref() {
                                 let relay = c.details.0.as_ref().and_then(|d| d.relay) == Some(true);
-                                self.cache.compaction(id, &self.ended_at, tokens(c.tokens_before), relay);
+                                self.cache.compaction(id, c.parent_id.as_deref(), &self.ended_at, tokens(c.tokens_before), relay);
                             }
                             return;
                         }
@@ -761,12 +766,16 @@ impl SessionAccumulator {
         match ty {
             "compaction" => {
                 let relay = obj.details.0.as_ref().and_then(|d| d.relay) == Some(true);
-                self.cache.compaction(id, ts, tokens(obj.tokens_before), relay);
+                self.cache.compaction(id, parent, ts, tokens(obj.tokens_before), relay);
             }
             "message" => match obj.message.0.as_ref() {
                 Some(m) if m.role.as_deref() == Some("assistant") => self.cache.assistant(id, parent, ts, asst_rec(m)),
                 _ => self.cache.other(id, parent),
             },
+            "usage" if obj.kind.as_deref() == Some("cache_warm") => {
+                let cr = obj.usage.0.as_ref().map_or(0, |u| tokens(u.cache_read));
+                self.cache.warm(id, parent, ts, cr);
+            }
             _ => self.cache.other(id, parent),
         }
     }
@@ -1636,7 +1645,7 @@ pub mod tests {
         let r1 = scan_sessions(&opts);
         assert_eq!(r1.parsed, 1);
         let c = load_cache(&cache);
-        assert_eq!(c.version, 4);
+        assert_eq!(c.version, 5);
         let cf = c.files.values().next().unwrap();
         assert_eq!(cf.parent_session, "/x/y.jsonl");
         assert_eq!(cf.daily.len(), 1);

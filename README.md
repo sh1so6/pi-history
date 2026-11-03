@@ -52,7 +52,7 @@ pi-history --no-dialog     # ダイアログを一切出さない（エラーは
 | `PI_SESSION_HISTORY_PI_CLI` | Pi の `cli.js` を指定（node 経由で起動） |
 | `PI_SESSION_HISTORY_NO_INJECT=1` | `/session/<id>` に見やすさ改善の CSS/JS を注入せず、素の `pi --export` HTML を返す |
 
-キャッシュ `<agentDir>/session-history/cache.json` は `{version:4, files:{<path>:{mtimeMs,size,entry,parentSession?,daily?,cacheDaily?,cacheEvents?}}}`。`entry` は従来どおり（TS 版と同形）ですが、`version` が違う旧キャッシュは捨てて全再パースします（TS 版とはもう共有しません）。
+キャッシュ `<agentDir>/session-history/cache.json` は `{version:5, files:{<path>:{mtimeMs,size,entry,parentSession?,daily?,cacheDaily?,cacheEvents?}}}`。`entry` は従来どおり（TS 版と同形）ですが、`version` が違う旧キャッシュは捨てて全再パースします（TS 版とはもう共有しません）。
 
 ## 支出（`spend`）
 
@@ -77,10 +77,12 @@ spend: [{date, project, model, input, output, cacheRead, cacheWrite, cost, messa
 cache:       [{date, project, sub, misses, missTokens, missCost, missTtl, missTtlTokens, missModel, missModelTokens,
                relays, relayBefore, relayAfter, relayDropped, relayRecache, relayRecacheCost,
                relayPostRequests, relaySavings,
+               relayLive, relayLiveRecacheCost, relayLiveSavings, relayLivePostRequests,
                compacts, compactBefore, compactAfter, compactDropped, compactRecache, compactRecacheCost,
-               compactPostRequests, compactSavings}]
+               compactPostRequests, compactSavings,
+               compactLive, compactLiveRecacheCost, compactLiveSavings, compactLivePostRequests}]
 cacheEvents: [{ts, date, project, sub, kind:"relay"|"compact", before, after, dropped, recache, recacheCost,
-               postRequests, savings, net, breakEven, open, sid, trigger}]
+               postRequests, savings, net, breakEven, open, live, sid, trigger}]
 ```
 
 - 件数・トークンは整数、`*Cost` は USD（f64）。原因「その他」は `misses - missTtl - missModel` でフロントが出す。全部 0 の行は出さない。
@@ -97,8 +99,12 @@ cacheEvents: [{ts, date, project, sub, kind:"relay"|"compact", before, after, dr
   - `rate = postCacheReadCost / postCacheRead`（`postCacheRead == 0` なら不明）。`savings = postRequests × dropped × rate`（USD。rate 不明なら 0）。`net = savings − recacheCost`（正なら回収済み）。`breakEven = recacheCost / (dropped × rate)`（リクエスト数。`dropped == 0`・rate 不明・rate 0（`cost.cacheRead` 無し）なら `null`）。
   - `open`: そのセッションファイルの**最後の** compaction イベントなら `true`（進行中、またはセッションがそこで終わった。数値はまだ増えうる）。それより前のイベントは `false`。
   - `cache` の日別行の `relayPostRequests` / `relaySavings` / `compactPostRequests` / `compactSavings` は、既存の `relay*` / `compact*` と同じ (date, project, sub) で合計（全部 0 の行を出さない規則は不変）。`savings` / `net` / `breakEven` / `open` は集計時に毎回計算する。
+- **`live`（イベント時点でプロンプトキャッシュが生きていたか）**: 「生きたキャッシュを捨てた＝本物の追加コスト」と「どうせ TTL 切れで再キャッシュは無料同然」を分けるための印（定数・コメントは `cachestat.rs` 冒頭）。
+  - compaction 行の親側の直前（`Prev::Asst`＝最寄りの有効な assistant 応答 p）について `expected = p.cacheRead + p.cacheWrite`。`lastTouch = max(p の行の timestamp（応答の終了時刻）, その後に同じ系列上にある `type:"usage"` かつ `kind:"cache_warm"` で `usage.cacheRead > 0` の行の timestamp)`（ツリーの各行が `epoch` と同様に親から継承）。
+  - `live = p が anthropic-messages && expected >= 4000 && (compaction 行の timestamp − lastTouch) <= TTL`（TTL は上の ttl と同じ tier 判定: 1h 書込みなら 3,600,000ms、それ以外 300,000ms）。**「イベントの瞬間」は compaction 行自身の timestamp で近似**（実際の relay / compaction はそれより少し前に始まっている可能性がある）。どれか欠ける（直前なし・時刻不明・Anthropic 以外）と `false`。
+  - `cache` 行の `relayLive` / `relayLiveRecacheCost` / `relayLiveSavings` / `relayLivePostRequests`（と `compact*`）は `live` なイベントだけの件数・再キャッシュ代・savings・postRequests の合計。「死んでいた分」は全体 − live でフロントが出す。
 - **`trigger`**（`"manual" | "input" | "expiry" | null`）: `<agentDir>/context-relay/log.jsonl`（`{at, sessionId, trigger, ok, …}`）と突き合わせる。relay イベントのみ、`sessionId == sid` かつ `ok == true` かつ時刻差が 120 秒以内（`TRIGGER_MATCH_MS`）の最も近い行を 1 行 1 回だけ使う。ログが無い・読めない・一致なし・compact は `null`。キャッシュファイルには保存せず、集計時に毎回付ける。
-- **実装**: 行は 1 回の走査で処理。2000 バイト超の行は従来どおり JSON 全体は読まず、`type:"compaction"` は必要な数項目だけ（`summary` / `systemMessage` は読み飛ばし）、他の巨大行は先頭（`"id"`/`"parentId"` が `type` の直後）か末尾（custom 系は末尾に `id`/`parentId`/`timestamp`）から `id` / `parentId` だけ取り出して系列を保ちます。セッションごとの結果（`cacheDaily` / `cacheEvents`）は cache.json に保存（`CACHE_VERSION` 4。旧キャッシュは自動で捨てて再パース）。日付を確定して保存するため、タイムゾーンを変えたら cache.json を消してください。
+- **実装**: 行は 1 回の走査で処理。2000 バイト超の行は従来どおり JSON 全体は読まず、`type:"compaction"` は必要な数項目だけ（`summary` / `systemMessage` は読み飛ばし）、他の巨大行は先頭（`"id"`/`"parentId"` が `type` の直後）か末尾（custom 系は末尾に `id`/`parentId`/`timestamp`）から `id` / `parentId` だけ取り出して系列を保ちます。セッションごとの結果（`cacheDaily` / `cacheEvents`）は cache.json に保存（`CACHE_VERSION` 5。旧キャッシュは自動で捨てて再パース）。日付を確定して保存するため、タイムゾーンを変えたら cache.json を消してください。
 - 実データ（約 1800 ファイル / 9.8GB）での目安: cache.json 約 9.3MB、`/api/index` 約 7.3MB（`cache` + `cacheEvents` は約 90KB）、全再スキャン約 0.9 秒・キャッシュ利用時 約 0.1〜0.2 秒（16 スレッド、OS ファイルキャッシュ温存時）。
 
 ## 個別セッション画面の見やすさ改善（配信時注入）

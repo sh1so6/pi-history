@@ -31,7 +31,18 @@ pub const TRIGGER_MATCH_MS: i64 = 120_000;
  *   break_even = recache_cost / (dropped * rate)  [requests]           (None when dropped == 0 or the rate is unknown)
  * `open`: the event is the LAST compaction of its session file (still in progress, or the session ended there);
  * its numbers may still grow. Earlier events of the file are closed.
- * These are derived in `build_cache`; only the three `post_*` sums are stored in the cache file. */
+ * These are derived in `build_cache`; only the three `post_*` sums are stored in the cache file.
+ *
+ * "live": was the prompt cache still alive when the event happened? (separates "dropped a live cache" = real extra
+ * cost from "the cache had expired anyway, so recaching was free".) The predecessor of the compaction on its chain is
+ * the last valid assistant (`Prev::Asst`); expected = its cacheRead + cacheWrite.
+ *   last_touch = max(timestamp of that assistant entry (response end), timestamp of the latest `cache_warm` usage
+ *                entry after it on the same chain)               (`Node::last_touch_ms`, inherited like the epoch)
+ *   live       = predecessor is an anthropic assistant && expected >= MISS_MIN_EXPECTED
+ *                && compaction_ts - last_touch <= ttl             (ttl = 1h when its `tier1h`, else 5m)
+ * The compaction entry's own timestamp stands in for "the moment of the event" (an approximation: the relay /
+ * compaction may have started a little earlier). Any missing piece (no predecessor, unparsable time, non-anthropic
+ * api) gives live = false. */
 
 /// Per (local date) miss counters of one session; stored in the cache file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -64,6 +75,8 @@ pub struct CacheEventRow {
     pub post_requests: u64,
     pub post_cache_read: u64,
     pub post_cache_read_cost: f64,
+    /// the prompt cache was still alive at the event (see "live" above)
+    pub live: bool,
 }
 
 impl CacheEventRow {
@@ -112,6 +125,8 @@ struct Asst {
 struct Node {
     prev: Prev,
     epoch: Option<usize>,
+    /// last time (ms epoch) the cache was touched on this chain since `prev`: the assistant's end or a `cache_warm`
+    last_touch_ms: Option<f64>,
 }
 
 /// What the children of an entry see as their predecessor.
@@ -171,7 +186,7 @@ pub struct CacheTracker {
 
 impl CacheTracker {
     fn node_of(&self, parent: Option<&str>) -> Node {
-        parent.and_then(|p| self.nodes.get(p)).copied().unwrap_or(Node { prev: Prev::None, epoch: None })
+        parent.and_then(|p| self.nodes.get(p)).copied().unwrap_or(Node { prev: Prev::None, epoch: None, last_touch_ms: None })
     }
 
     /// Any entry that is neither a valid assistant message nor a compaction: transparent for the chain.
@@ -180,18 +195,46 @@ impl CacheTracker {
         self.nodes.insert(id.to_string(), n);
     }
 
+    /// A cache warmer entry: transparent for the chain, but a non-empty cache read keeps the cache alive until `ts`.
+    pub fn warm(&mut self, id: &str, parent: Option<&str>, ts: &str, cache_read: u64) {
+        let mut n = self.node_of(parent);
+        if cache_read > 0 {
+            if let Some(t) = ts_ms(ts).map(|t| t as f64) {
+                n.last_touch_ms = Some(n.last_touch_ms.map_or(t, |l| l.max(t)));
+            }
+        }
+        self.nodes.insert(id.to_string(), n);
+    }
+
+    /// Was the cache alive when a compaction at `ts` (child of `node`) happened?
+    fn is_live(&self, node: &Node, ts: &str) -> bool {
+        let Prev::Asst(i) = node.prev else { return false };
+        let p = &self.assts[i];
+        let pr = &p.rec;
+        if !pr.anthropic || pr.cr + pr.cw < MISS_MIN_EXPECTED {
+            return false;
+        }
+        let ttl = if p.tier1h { TTL_LONG_MS } else { TTL_SHORT_MS };
+        match (ts_ms(ts), node.last_touch_ms) {
+            (Some(now), Some(touch)) => now as f64 - touch <= ttl,
+            _ => false,
+        }
+    }
+
     /// A compaction cuts the chain: its descendants have no predecessor beyond it.
-    pub fn compaction(&mut self, id: &str, ts: &str, before: u64, relay: bool) {
+    pub fn compaction(&mut self, id: &str, parent: Option<&str>, ts: &str, before: u64, relay: bool) {
         let idx = self.events.len();
+        let live = self.is_live(&self.node_of(parent), ts);
         self.events.push(CacheEventRow {
             ts: ts.to_string(),
             date: local_date(ts).unwrap_or_default(),
             kind: if relay { "relay" } else { "compact" }.to_string(),
             before,
+            live,
             ..Default::default()
         });
         self.done.push(false);
-        self.nodes.insert(id.to_string(), Node { prev: Prev::Compaction(idx), epoch: Some(idx) });
+        self.nodes.insert(id.to_string(), Node { prev: Prev::Compaction(idx), epoch: Some(idx), last_touch_ms: None });
     }
 
     /// An assistant message; `rec` is None when it is not a valid response (then it is transparent).
@@ -232,7 +275,8 @@ impl CacheTracker {
         }
         let tier1h = if a.cw > 0 { a.cw1h > 0 } else { inherited_tier };
         self.assts.push(Asst { rec: a, tier1h });
-        self.nodes.insert(id.to_string(), Node { prev: Prev::Asst(self.assts.len() - 1), epoch: node.epoch });
+        let last_touch_ms = ts_ms(ts).map(|t| t as f64);
+        self.nodes.insert(id.to_string(), Node { prev: Prev::Asst(self.assts.len() - 1), epoch: node.epoch, last_touch_ms });
     }
 
     fn record_miss(&mut self, ts: &str, m: Miss) {
@@ -284,6 +328,11 @@ pub struct CacheRow {
     pub relay_recache_cost: f64,
     pub relay_post_requests: u64,
     pub relay_savings: f64,
+    /// the same sums over the events whose prompt cache was still alive (`live`); dead = total - live
+    pub relay_live: u64,
+    pub relay_live_recache_cost: f64,
+    pub relay_live_savings: f64,
+    pub relay_live_post_requests: u64,
     pub compacts: u64,
     pub compact_before: u64,
     pub compact_after: u64,
@@ -292,6 +341,11 @@ pub struct CacheRow {
     pub compact_recache_cost: f64,
     pub compact_post_requests: u64,
     pub compact_savings: f64,
+    /// the same sums over the events whose prompt cache was still alive (`live`); dead = total - live
+    pub compact_live: u64,
+    pub compact_live_recache_cost: f64,
+    pub compact_live_savings: f64,
+    pub compact_live_post_requests: u64,
 }
 
 impl CacheRow {
@@ -319,6 +373,8 @@ pub struct CacheEvent {
     pub net: f64,
     pub break_even: Option<f64>,
     pub open: bool,
+    /// the prompt cache was still alive at the event
+    pub live: bool,
     pub sid: String,
     pub trigger: Option<String>,
 }
@@ -402,6 +458,12 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 r.relay_recache_cost += e.recache_cost;
                 r.relay_post_requests += e.post_requests;
                 r.relay_savings += e.savings();
+                if e.live {
+                    r.relay_live += 1;
+                    r.relay_live_recache_cost += e.recache_cost;
+                    r.relay_live_savings += e.savings();
+                    r.relay_live_post_requests += e.post_requests;
+                }
             } else {
                 r.compacts += 1;
                 r.compact_before += e.before;
@@ -411,6 +473,12 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 r.compact_recache_cost += e.recache_cost;
                 r.compact_post_requests += e.post_requests;
                 r.compact_savings += e.savings();
+                if e.live {
+                    r.compact_live += 1;
+                    r.compact_live_recache_cost += e.recache_cost;
+                    r.compact_live_savings += e.savings();
+                    r.compact_live_post_requests += e.post_requests;
+                }
             }
             events.push(CacheEvent {
                 ts: e.ts.clone(),
@@ -428,6 +496,7 @@ pub fn build_cache(all: &[Scanned], relay_log: &[RelayLog]) -> (Vec<CacheRow>, V
                 net: e.net(),
                 break_even: e.break_even(),
                 open: k == last,
+                live: e.live,
                 sid: s.entry.id.clone(),
                 trigger: None,
             });

@@ -313,15 +313,16 @@ fn cache_folds_subagents_into_owner_project() {
     let v = serde_json::to_value(&rows[0]).unwrap();
     for k in ["date", "project", "sub", "misses", "missTokens", "missCost", "missTtl", "missTtlTokens", "missModel", "missModelTokens", "relays", "relayBefore", "relayAfter",
         "relayDropped", "relayRecache", "relayRecacheCost", "compacts", "compactBefore", "compactAfter", "compactDropped", "compactRecache", "compactRecacheCost",
-        "relayPostRequests", "relaySavings", "compactPostRequests", "compactSavings"] {
+        "relayPostRequests", "relaySavings", "compactPostRequests", "compactSavings", "relayLive", "relayLiveRecacheCost", "relayLiveSavings",
+        "relayLivePostRequests", "compactLive", "compactLiveRecacheCost", "compactLiveSavings", "compactLivePostRequests"] {
         assert!(v.get(k).is_some(), "{k}");
     }
-    assert_eq!(v.as_object().unwrap().len(), 26);
+    assert_eq!(v.as_object().unwrap().len(), 34);
     let v = serde_json::to_value(&events[0]).unwrap();
-    for k in ["ts", "date", "project", "sub", "kind", "before", "after", "dropped", "recache", "recacheCost", "postRequests", "savings", "net", "breakEven", "open", "sid", "trigger"] {
+    for k in ["ts", "date", "project", "sub", "kind", "before", "after", "dropped", "recache", "recacheCost", "postRequests", "savings", "net", "breakEven", "open", "live", "sid", "trigger"] {
         assert!(v.get(k).is_some(), "{k}");
     }
-    assert_eq!(v.as_object().unwrap().len(), 17);
+    assert_eq!(v.as_object().unwrap().len(), 18);
     assert!(v["trigger"].is_null());
 }
 
@@ -397,7 +398,7 @@ fn miss_rows_roundtrip_through_cache_file() {
     assert_eq!((r2.parsed, r2.cached), (0, 1));
     assert_eq!(r2.cache, r1.cache);
     let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-    assert_eq!(raw["version"], 4);
+    assert_eq!(raw["version"], 5);
     assert_eq!(raw["files"].as_object().unwrap().values().next().unwrap()["cacheDaily"][0]["missTtl"], 1);
     // a v2 cache is dropped and re-parsed
     let mut v = raw;
@@ -535,4 +536,91 @@ fn break_even_unknown_without_dropped_or_read_cost() {
     // no later request at all
     let sp = parse(vec![comp("c1", None, 1_000.0, 100_000, true, 0)]);
     assert_eq!((sp.cache_events[0].post_requests, sp.cache_events[0].break_even()), (0, None));
+}
+
+/* ------------------------------------------------------------------ live (cache still alive at the event) */
+
+fn a1h(id: &str, parent: Option<&str>, start: f64) -> String {
+    asst(id, parent, start, "anthropic", "opus", API_ANTHROPIC, (10, 0, 40_000, 40_000), 0.0, "stop")
+}
+
+fn warm(id: &str, parent: &str, at: f64, cr: u64) -> String {
+    format!(
+        r#"{{"type":"usage","id":"{id}","parentId":"{parent}","timestamp":"{}","kind":"cache_warm","usage":{{"cacheRead":{cr},"cost":{{"total":0.01}}}}}}"#,
+        iso_from_ms(T0 + at)
+    )
+}
+
+const MIN: f64 = 60_000.0;
+
+#[test]
+fn live_one_hour_write_shortly_before_the_event() {
+    let sp = parse(vec![a1h("a1", None, 0.0), comp("c1", Some("a1"), 10.0 * MIN, 100_000, true, 0)]);
+    assert!(sp.cache_events[0].live);
+}
+
+#[test]
+fn not_live_two_hours_later() {
+    let sp = parse(vec![a1h("a1", None, 0.0), comp("c1", Some("a1"), 120.0 * MIN, 100_000, true, 0)]);
+    assert!(!sp.cache_events[0].live);
+}
+
+#[test]
+fn five_minute_tier_expires_but_a_warmer_keeps_it_alive() {
+    let dead = parse(vec![a("a1", None, 0.0, 0, 40_000), comp("c1", Some("a1"), 6.0 * MIN, 100_000, false, 0)]);
+    assert!(!dead.cache_events[0].live);
+    let alive = parse(vec![
+        a("a1", None, 0.0, 0, 40_000),
+        warm("w1", "a1", 4.0 * MIN, 40_000),
+        comp("c1", Some("w1"), 6.0 * MIN, 100_000, false, 0),
+    ]);
+    assert!(alive.cache_events[0].live);
+    // a warmer that read nothing does not count; neither does a short expectation
+    let empty = parse(vec![a("a1", None, 0.0, 0, 40_000), warm("w1", "a1", 4.0 * MIN, 0), comp("c1", Some("w1"), 6.0 * MIN, 100_000, false, 0)]);
+    assert!(!empty.cache_events[0].live);
+    let small = parse(vec![a("a1", None, 0.0, 0, 3_000), comp("c1", Some("a1"), 2.0 * MIN, 100_000, false, 0)]);
+    assert!(!small.cache_events[0].live);
+    // no predecessor
+    assert!(!parse(vec![comp("c1", None, 1.0 * MIN, 100_000, true, 0)]).cache_events[0].live);
+}
+
+#[test]
+fn non_anthropic_is_never_live() {
+    let l = asst("a1", None, 0.0, "openai", "gpt", "openai-responses", (10, 0, 40_000, 0), 0.0, "stop");
+    assert!(!parse(vec![l, comp("c1", Some("a1"), 1.0 * MIN, 100_000, true, 0)]).cache_events[0].live);
+}
+
+#[test]
+fn live_splits_are_aggregated() {
+    let sp = parse(vec![
+        a1h("a1", None, 0.0),
+        comp("c1", Some("a1"), 2.0 * MIN, 100_000, true, 0), // live relay
+        req("r1", Some("c1"), 3.0 * MIN, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r2", "r1", 4.0 * MIN),
+        comp("c2", Some("r2"), 400.0 * MIN, 100_000, true, 0), // dead relay
+        req("r3", Some("c2"), 401.0 * MIN, (0, 0, 30_000), Some(0.0), 0.15, "stop"),
+        rd("r4", "r3", 402.0 * MIN),
+    ]);
+    assert_eq!(sp.cache_events.iter().map(|e| e.live).collect::<Vec<_>>(), [true, false]);
+    let (rows, ev) = cache_of(sp);
+    assert_eq!(ev.iter().map(|e| e.live).collect::<Vec<_>>(), [true, false]);
+    let mut sum = CacheRow::default();
+    for x in &rows {
+        sum.relays += x.relays;
+        sum.relay_live += x.relay_live;
+        sum.compact_live += x.compact_live;
+        sum.relay_recache_cost += x.relay_recache_cost;
+        sum.relay_live_recache_cost += x.relay_live_recache_cost;
+        sum.relay_live_post_requests += x.relay_live_post_requests;
+        sum.relay_live_savings += x.relay_live_savings;
+    }
+    let r = &sum;
+    assert_eq!((r.relays, r.relay_live, r.compact_live), (2, 1, 0));
+    assert!(close(r.relay_live_recache_cost, 0.15) && close(r.relay_recache_cost, 0.30), "{r:?}");
+    assert_eq!(r.relay_live_post_requests, ev[0].post_requests);
+    assert!(close(r.relay_live_savings, ev[0].savings), "{} {}", r.relay_live_savings, ev[0].savings);
+    let v = serde_json::to_value(&ev[0]).unwrap();
+    assert_eq!(v["live"], true);
+    let v = serde_json::to_value(&rows[0]).unwrap();
+    assert!(v["relayLive"].is_u64() && v["relayLiveRecacheCost"].is_f64() && v["compactLivePostRequests"].is_u64());
 }
