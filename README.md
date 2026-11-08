@@ -35,6 +35,7 @@ pi-history --no-dialog     # ダイアログを一切出さない（エラーは
 - sessions が見つからない・選択キャンセルなどの致命エラーは、標準エラーに加えてメッセージボックスでも表示します（コンソールが即閉じても分かるように）。
 - `--no-dialog`、`PI_SESSION_HISTORY_NO_DIALOG=1`、`PI_SESSION_HISTORY_NO_OPEN=1` のいずれかがあるとダイアログ／メッセージボックスを一切出さず、標準エラーのみで終了コード 1 になります（自動テスト・CI 向け）。
 
+- 一覧ページ右上の **STOP** ボタンでも常駐サーバを停止できます（`POST /api/stop`。`/api/ui-prefs` と同じく token 無しだが、JSON の Content-Type と自サーバの Origin が必須。止めた後はタブに「停止しました」と出ます）。
 - 2 回目以降の起動は既存サーバを再利用します（再スキャンさせてからページを開くだけ）。
 - ポート／PID／トークンは `<agentDir>/session-history/server.json`。`stop` はこのトークン付きで `/api/shutdown` を呼び、止まらなければ PID を kill します。server.json が古い（プロセスが無い）場合は自動で作り直します。
 - `GET /` 一覧 / `GET /api/index` 索引 JSON / `GET /session/<id>` 個別セッション HTML（索引にある id のみ）。Host が `127.0.0.1:<port>` / `localhost:<port>` 以外は 403。

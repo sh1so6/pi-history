@@ -8,6 +8,10 @@ body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,"Sego
 header{padding:12px 20px;border-bottom:1px solid var(--bd);display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
 h1{font-size:18px;margin:0}
 #gen{color:var(--mut);font-size:12px}
+#stopBtn{margin-left:auto;align-self:center;font:inherit;font-size:12px;font-weight:600;letter-spacing:.04em;border:1px solid var(--bd);border-radius:6px;padding:3px 12px;background:transparent;color:inherit;cursor:pointer}
+#stopBtn:hover,#stopBtn:focus-visible{border-color:#c8283f;color:#c8283f}
+#stopBtn:disabled{opacity:.5;cursor:default}
+.stopped{padding:48px 20px;text-align:center;color:var(--mut)}
 .layout{display:grid;grid-template-columns:300px 1fr;gap:20px;padding:16px 20px;align-items:start}
 @media (max-width:820px){.layout{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px}
@@ -123,7 +127,7 @@ table.sp .tg[aria-expanded=true]{transform:rotate(90deg)}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
 </style></head>
 <body>
-<header><h1>Pi セッション履歴</h1><span id="gen"></span></header>
+<header><h1>Pi セッション履歴</h1><span id="gen"></span><button type="button" id="stopBtn" title="pi-history（常駐サーバ）を停止します">STOP</button></header>
 <div class="layout">
 <aside class="side panel" aria-label="カレンダー">
 <div class="calhead"><button type="button" id="prev" aria-label="前の月">‹</button><span id="monthLabel" aria-live="polite"></span><button type="button" id="next" aria-label="次の月">›</button><button type="button" id="todayBtn">今月</button></div>
@@ -332,6 +336,15 @@ var ESC={"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"};
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return ESC[c]})}
 var WD=["日","月","火","水","木","金","土"];
 var base=[];
+$("stopBtn").addEventListener("click",function(){
+  if(!confirm("pi-history を停止しますか？（再び開くには /history か pi-history を実行します）"))return;
+  var b=$("stopBtn");b.disabled=true;
+  fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    document.body.innerHTML='<p class="stopped">pi-history を停止しました。このタブは閉じて構いません。</p>';
+    try{window.close()}catch(e){}
+  }).catch(function(e){b.disabled=false;toast("停止できませんでした: "+e.message)});
+});
 function toast(msg){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toast.t);toast.t=setTimeout(function(){t.classList.remove("show")},1800)}
 function copy(text){
   var done=function(){toast("コピーしました")};

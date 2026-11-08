@@ -258,6 +258,9 @@ pub fn handle(state: &Arc<AppState>, req: Request) {
     if method == Method::Post && path == "/api/ui-prefs" {
         return handle_prefs_post(state, req);
     }
+    if method == Method::Post && path == "/api/stop" {
+        return handle_stop_post(state, req);
+    }
     if method != Method::Get && method != Method::Head {
         return send_html(req, 405, "method not allowed", &[("Allow", "GET, HEAD")]);
     }
@@ -305,19 +308,34 @@ pub fn handle(state: &Arc<AppState>, req: Request) {
     send_html(req, 404, "not found", &[])
 }
 
+fn respond_shutdown(state: &Arc<AppState>, req: Request) {
+    send(req, 200, JSON, format!("{{\"ok\":true,\"pid\":{}}}", std::process::id()).into_bytes(), &[]);
+    let st = state.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        (st.on_shutdown)();
+    });
+}
+
+/// POST /api/stop: the STOP button in the page. Like /api/ui-prefs it has no server.json token (the page cannot know it);
+/// Host is already checked, and the request must be JSON with this server's own Origin, so other sites / forms cannot stop it.
+fn handle_stop_post(state: &Arc<AppState>, req: Request) {
+    if !is_json_content_type(header_value(&req, "Content-Type").as_deref()) {
+        return json_error(req, 415, "Content-Type must be application/json");
+    }
+    if !is_own_origin(header_value(&req, "Origin").as_deref(), state.port) {
+        return json_error(req, 403, "bad origin");
+    }
+    respond_shutdown(state, req);
+}
+
 fn handle_control(state: &Arc<AppState>, req: Request, path: &str, query: &str) {
     // state-changing endpoints need the secret from server.json (CSRF / DNS-rebinding guard on top of the Host check)
     if header_value(&req, TOKEN_HEADER).as_deref() != Some(state.token.as_str()) {
         return send_html(req, 403, "bad token", &[]);
     }
     if path == "/api/shutdown" {
-        send(req, 200, JSON, format!("{{\"ok\":true,\"pid\":{}}}", std::process::id()).into_bytes(), &[]);
-        let st = state.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            (st.on_shutdown)();
-        });
-        return;
+        return respond_shutdown(state, req);
     }
     let include = query_flag(query, "all");
     match state.rescan(include, Some(&|d, t| crate::log_progress(d, t))) {
@@ -505,6 +523,18 @@ mod tests {
         assert_eq!(v["sessions"], 1);
         assert!(!down.load(Ordering::SeqCst));
         assert_eq!(request(port, "POST", "/api/shutdown", None, &[]).0, 403);
+        // STOP button endpoint: JSON + own Origin required, no token; refused requests do not stop the server
+        assert_eq!(request_body(port, "POST", "/api/stop", Some("evil.example"), &[json_ct, ("Origin", &own)], "{}").0, 403);
+        assert_eq!(request_body(port, "POST", "/api/stop", None, &[("Origin", &own)], "{}").0, 415);
+        assert_eq!(request_body(port, "POST", "/api/stop", None, &[json_ct], "{}").0, 403);
+        assert_eq!(request_body(port, "POST", "/api/stop", None, &[json_ct, ("Origin", "http://evil.example")], "{}").0, 403);
+        assert_eq!(request(port, "GET", "/api/stop", None, &[]).0, 404);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!down.load(Ordering::SeqCst));
+        assert_eq!(request_body(port, "POST", "/api/stop", None, &[json_ct, ("Origin", &own)], "{}").0, 200);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(down.load(Ordering::SeqCst));
+        down.store(false, Ordering::SeqCst);
         assert_eq!(request(port, "POST", "/api/shutdown", None, &[(TOKEN_HEADER, "secret")]).0, 200);
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(down.load(Ordering::SeqCst));
